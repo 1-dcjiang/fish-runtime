@@ -644,6 +644,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if now is None:
         now = datetime.now().replace(microsecond=0)
+    # A timestamp ahead of the clock (a clock that jumped back, or a --now replay) would otherwise
+    # silence the character forever: decide() ignores it, so idle can never accumulate. Reset it here,
+    # once, where the current time is actually known — decide() stays read-only.
+    for key in TIMESTAMP_KEYS:
+        stamp = parse_timestamp(state.get(key))
+        if stamp and stamp > now:
+            print(f"warning: state {key} is in the future ({stamp.isoformat()}); reset",
+                  file=sys.stderr)
+            state[key] = now.isoformat() if key == "started_at" else None
     if not state.get("started_at"):
         state["started_at"] = now.isoformat()
 

@@ -547,6 +547,20 @@ class RuntimeHygieneTests(FishTest):
                                         "--now", self.now]), 0)
         self.assertIn("no cycle_script configured", errors.getvalue())
 
+    def test_future_started_at_is_reset_and_then_heals(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        self.seed_state(started_at="2026-11-11T00:00")
+        first = self.run_cmd(["tick", "--config", str(self.dir / "config.json"), "--now", self.now])
+        self.assertIn("not_idle_enough", first)
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved["started_at"].startswith("2026-11-10T10:00"),
+                        "a future start must be reset, not kept")
+        second = self.run_cmd(["tick", "--config", str(self.dir / "config.json"),
+                               "--now", "2026-11-10T20:00"])
+        self.assertIn("[tick] spoke", second, "one beat later it must be able to speak again")
+
     def test_missing_state_file_is_not_fatal(self):
         self.assertIsInstance(fish.load_state(self.dir / "missing.json"), dict)
 
