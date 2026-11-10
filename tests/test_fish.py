@@ -564,6 +564,45 @@ class RuntimeHygieneTests(FishTest):
     def test_missing_state_file_is_not_fatal(self):
         self.assertIsInstance(fish.load_state(self.dir / "missing.json"), dict)
 
+    def test_heal_runs_on_every_beat_so_a_mid_run_jump_recovers(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        cfg = fish.load_config(self.config())
+        self.seed_state()
+        first = self.run_cmd(["tick", "--config", str(self.dir / "config.json"), "--now", self.now])
+        self.assertIn("[tick] spoke", first)
+        # the OS clock jumps back a day: the stored stamps now sit in the future, and a running process
+        # holds this state in memory instead of reloading it, so the CLI entry point would never see them
+        state = fish.load_state(self.state_file)
+        state["started_at"] = "2026-11-12T00:00"
+        state["last_user_at"] = "2026-11-12T00:00"
+        errors = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            self.assertEqual(fish.cmd_tick(cfg, state, datetime(2026, 11, 10, 10, 0)), 0)
+        self.assertEqual(errors.getvalue().count("started_at is in the future"), 1)
+        self.assertTrue(state["started_at"].startswith("2026-11-10T10:00"),
+                        "the beat itself must rewrite a future start, not just the CLI entry point")
+        self.assertIsNone(state["last_user_at"])
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved["started_at"].startswith("2026-11-10T10:00"))
+
+    def test_status_persists_a_healed_timestamp(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        self.seed_state(started_at="2026-11-11T00:00")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.run_cmd(["status", "--config", str(self.dir / "config.json"), "--now", self.now])
+        self.assertIn("started_at is in the future", errors.getvalue())
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved["started_at"].startswith("2026-11-10T10:00"))
+        # the warning must not repeat on the next call: the file is already correct
+        second = io.StringIO()
+        with redirect_stderr(second):
+            self.run_cmd(["status", "--config", str(self.dir / "config.json"), "--now", self.now])
+        self.assertNotIn("in the future", second.getvalue())
+
 
 class FormatTests(unittest.TestCase):
     def test_parse_now_accepts_iso_and_space(self):

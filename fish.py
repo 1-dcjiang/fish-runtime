@@ -152,6 +152,26 @@ def save_state(path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
+def heal_future_timestamps(state: dict, now: datetime) -> list[str]:
+    """Drop any timestamp ahead of the clock. Returns the keys that were reset.
+
+    A clock that jumped back — or a --now replay earlier than the stored state — otherwise silences the
+    character forever: decide() treats a future stamp as absent, so idle never accumulates. Called at the
+    entry of every command *and* at the start of each beat, so a jump mid-process heals without a restart.
+    """
+    healed = []
+    for key in TIMESTAMP_KEYS:
+        stamp = parse_timestamp(state.get(key))
+        if stamp and stamp > now:
+            print(f"warning: state {key} is in the future ({stamp.isoformat()}); reset",
+                  file=sys.stderr)
+            state[key] = now.isoformat() if key == "started_at" else None
+            healed.append(key)
+    if not state.get("started_at"):
+        state["started_at"] = now.isoformat()
+    return healed
+
+
 def mood_now(state: dict, now: datetime) -> float:
     raw = float(state.get("mood", 0.0))
     stamp = state.get("mood_at")
@@ -432,6 +452,10 @@ def load_persona(cfg: dict) -> dict:
 def cmd_status(cfg: dict, state: dict, now: datetime) -> int:
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
+    # status is read-only for the memory, but a healed timestamp is worth persisting once: otherwise the
+    # same warning fires on every status call and the state on disk stays wrong.
+    if heal_future_timestamps(state, now):
+        save_state(Path(cfg["state_file"]), state)
     entries = read_index(memory_root)
     peak = peak_memory(entries, float(cfg["beat"].get("min_weight", 0.5)))
     may, reason = decide(cfg, state, entries, now)
@@ -458,6 +482,9 @@ def cmd_status(cfg: dict, state: dict, now: datetime) -> int:
 def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
+    # a resident run keeps `state` in memory across beats, so a clock that jumps back mid-process must heal
+    # here too — the entry-point heal only covers the first beat of each CLI invocation
+    heal_future_timestamps(state, now)
     state.setdefault("started_at", now.isoformat())
     roll_day(state, now.date().isoformat())
     entries = read_index(memory_root)
@@ -659,14 +686,10 @@ def main(argv: list[str] | None = None) -> int:
     # A timestamp ahead of the clock (a clock that jumped back, or a --now replay) would otherwise
     # silence the character forever: decide() ignores it, so idle can never accumulate. Reset it here,
     # once, where the current time is actually known — decide() stays read-only.
-    for key in TIMESTAMP_KEYS:
-        stamp = parse_timestamp(state.get(key))
-        if stamp and stamp > now:
-            print(f"warning: state {key} is in the future ({stamp.isoformat()}); reset",
-                  file=sys.stderr)
-            state[key] = now.isoformat() if key == "started_at" else None
-    if not state.get("started_at"):
-        state["started_at"] = now.isoformat()
+    healed = heal_future_timestamps(state, now)
+    if healed and args.command == "status":
+        # status writes nothing else, so without this the same warning would repeat on every call
+        save_state(Path(cfg["state_file"]), state)
 
     if args.command == "status":
         return cmd_status(cfg, state, now)

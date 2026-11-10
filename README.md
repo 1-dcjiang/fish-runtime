@@ -200,22 +200,24 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-77 tests, no network, no real clock. The 48 CLI cases plus 29 bot cases: config validation refusing to start
+79 tests, no network, no real clock. The 50 CLI cases plus 29 bot cases: config validation refusing to start
 without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
 parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
 Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gateway identify with the right
 intents, and WebSocket frame roundtrips at 7, 200 and 70,000 bytes.
 
-The 48 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
+The 50 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
 format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still
 parsing, an unrelated message touching nothing, shared function words (`the`) not counting as a shared topic,
 `decide()` provably not mutating state, a broken persona card falling back instead of crashing, a broken
 `mood_at` using the stored mood, corrupt state healing on the next save (timestamps, `mood`, `sent_today`),
-a future `started_at` being reset so the next beat can speak again, `verify` bumping `verified` and mood,
-unknown ids failing loudly, superseded entries staying out of recall, `say` leaving a fresh INDEX, Ctrl-C
-during both a tick and the wait exiting 0 with `[run] stopped`, a missing `cycle_script` being announced,
-`--no-record`, a greeting not becoming a memory, `record_episodes: always` overriding that, and `run --once`.
+a future `started_at` being reset so the next beat can speak again, the same heal firing inside a beat so a
+mid-run clock jump recovers without a restart, `status` persisting a healed timestamp instead of warning on
+every call, `verify` bumping `verified` and mood, unknown ids failing loudly, superseded entries staying out
+of recall, `say` leaving a fresh INDEX, Ctrl-C during both a tick and the wait exiting 0 with `[run] stopped`,
+a missing `cycle_script` being announced, `--no-record`, a greeting not becoming a memory,
+`record_episodes: always` overriding that, and `run --once`.
 
 ## Limits, stated rather than discovered
 
