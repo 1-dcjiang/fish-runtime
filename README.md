@@ -271,7 +271,7 @@ Python 3.10+. No dependencies outside the standard library.
 | `state_file` | where mood/timestamps/counters live |
 | `cycle_script` | path to the skill's `memory_cycle.py`; if missing, the runtime warns and keeps going |
 | `run_cycle_on_tick` | run the decay/fold/archive/promote cycle after each beat |
-| `record_episodes` | `auto` (skip greetings and anything under 12 chars — "在吗" is not a memory), `always`, `off` |
+| `record_episodes` | `auto` (skip greetings and anything under 12 chars — "在吗" is not a memory), `always`, `off` — nothing else is accepted, by the configurator or at startup |
 | `model.mode` | `offline` (deterministic template voice) or `openai` (`base_url`, `model`, `api_key_env`; `name` is accepted as a legacy alias for `model`) |
 | `channel.type` | `stdout`, `telegram` (`token_env`, `chat_id_env`), `webhook` (`url`) |
 | `beat.interval_seconds` | heartbeat period for `run` |
@@ -330,9 +330,10 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-123 tests, no network, no real clock. 50 CLI cases, 59 bot cases and 14 configurator cases: config
+125 tests, no network, no real clock. 50 CLI cases, 60 bot cases and 15 configurator cases: config
 validation refusing to start
-without a token or an allowlist, a wrong shape reported instead of crashing a beat, strangers ignored, a
+without a token or an allowlist, a wrong shape reported instead of crashing a beat, `record_episodes`
+accepting only its three words, strangers ignored, a
 trusted user id not trusted in an unlisted group, `/help` not touching memory, `/status` reporting counts,
 `/status@fish_bot` parsed in groups, replies quoting memory by default and the one switch turning that off,
 a group getting its own memory store and state file, per-group quoting and recording, its own beat interval,

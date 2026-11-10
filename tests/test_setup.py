@@ -144,6 +144,21 @@ class SetupTests(unittest.TestCase):
         self.assertIn("two hours", err)
         self.assertFalse(self.config.exists())
 
+    def test_record_episodes_only_accepts_its_three_words(self):
+        code, _out, err = self.run_setup("set", "record_episodes=sometimes")
+        self.assertEqual(code, 3)
+        self.assertIn("one of auto, always, off", err)
+        self.assertFalse(self.config.exists())
+        code, _out, err = self.run_setup("set", "record_episodes=true")
+        self.assertEqual(code, 3)
+        self.assertIn("one of auto, always, off", err)
+        self.assertFalse(self.config.exists())
+        code, _out, _err = self.run_setup("set", "platform=[\"telegram\"]",
+                                          "telegram.allow_chat_ids=[111]",
+                                          "record_episodes=always")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8"))["record_episodes"], "always")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -148,6 +148,8 @@ TYPE_RULES = {
     "discord.token_env": ("str", None, None),
     "model.mode": ("str", None, None),
     "model.timeout": ("int", 1, None),
+    # a policy, not a free string: "sometimes" would be silently read as auto
+    "record_episodes": ("one", ["auto", "always", "off"], None),
     # per-conversation settings; the chat id segment is free-form, the tail is fixed
     "chats.*.include_memory": ("bool", None, None),
     "chats.*.record": ("bool", None, None),
@@ -173,6 +175,7 @@ TYPE_HINTS = {
     "id": "a chat/user id (number or string)",
     "hours": "two hours 0–23, like [23,7]",
     "ids": "a list of ids, like [123456789]",
+    "one": "one of the allowed words",
 }
 
 
@@ -213,6 +216,11 @@ def check_type(path: str, value) -> str | None:
             if isinstance(item, bool) or not isinstance(item, (str, int)):
                 return f"{path} must be {hint} (got {value!r})"
         return None
+    if kind == "one":
+        choices = list(low)
+        if isinstance(value, str) and value.lower() in choices:
+            return None
+        return f"{path} must be one of {', '.join(choices)} (got {value!r})"
     if kind == "int":
         if not isinstance(value, int) or isinstance(value, bool):
             return f"{path} must be {hint} (got {value!r})"

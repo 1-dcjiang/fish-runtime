@@ -152,6 +152,15 @@ class ContextTests(BotFixture):
         joined = " | ".join(bot.validate(self.cfg))
         self.assertIn("unknown field quote_memory", joined)
 
+    def test_a_record_policy_typo_is_reported_at_startup(self):
+        self.cfg["record_episodes"] = "sometimes"
+        joined = " | ".join(bot.validate(self.cfg))
+        self.assertIn("record_episodes must be one of auto, always, off", joined)
+        self.cfg["record_episodes"] = True
+        self.assertIn("record_episodes must be one of auto, always, off", " | ".join(bot.validate(self.cfg)))
+        self.cfg["record_episodes"] = "always"
+        self.assertNotIn("record_episodes", " | ".join(bot.validate(self.cfg)))
+
     def test_a_group_beat_needs_its_chat_allowlisted(self):
         self.cfg["chats"] = {"-100999": {"proactive": {"enabled": True}}}
         joined = " | ".join(bot.validate(self.cfg))
