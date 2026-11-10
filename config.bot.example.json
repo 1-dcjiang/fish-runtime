@@ -19,5 +19,11 @@
   "limits": {
     "max_messages_per_minute": 6,
     "max_message_chars": 800
+  },
+  "proactive": {
+    "enabled": false,
+    "platform": "telegram",
+    "target": 123456789,
+    "interval_seconds": 900
   }
 }

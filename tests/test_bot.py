@@ -343,5 +343,80 @@ class IntegrationTests(BotFixture):
         self.assertGreaterEqual(mc.parse_entry(self.memory / "entries" / "m-20261109-01.md")["verified"], 1)
 
 
+class ProactiveTests(BotFixture):
+    """The heartbeat wired to a chat: decide() still owns every reason to stay silent."""
+
+    def make_loop(self, sent, ok=True, now=None):
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111",
+                                 "interval_seconds": 900}
+        sender = lambda text: (sent.append(text), {"ok": ok, "channel": "telegram"})[1]
+        return bot.BeatLoop(self.cfg, self.state, sender,
+                            now_fn=lambda: fish.parse_now(now or self.now))
+
+    def test_validate_rejects_proactive_without_a_target(self):
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": ""}
+        self.assertIn("proactive: target chat/channel id is empty", " | ".join(bot.validate(self.cfg)))
+
+    def test_validate_rejects_a_target_outside_the_allowlist(self):
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "999"}
+        self.assertIn("is not in the telegram allowlist", " | ".join(bot.validate(self.cfg)))
+
+    def test_a_configured_target_validates(self):
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111"}
+        self.assertEqual(bot.validate(self.cfg), [])
+
+    def test_an_idle_character_speaks_on_its_own(self):
+        self.write_entry(weight=0.9)
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-09T20:00"
+        self.state["started_at"] = "2026-11-01T00:00"
+        sent = []
+        loop = self.make_loop(sent)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(loop.beat_once())
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.state["sent_today"], 1)
+        self.assertTrue(self.state["last_nudge_at"].startswith("2026-11-10T10:00"))
+
+    def test_a_recent_user_message_keeps_it_quiet(self):
+        self.write_entry(weight=0.9)
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-10T09:50"
+        self.state["started_at"] = "2026-11-01T00:00"
+        sent = []
+        loop = self.make_loop(sent)
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(loop.beat_once())
+        self.assertEqual(sent, [])
+
+    def test_the_daily_cap_survives_proactive_beats(self):
+        self.write_entry(weight=0.9)
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-09T20:00"
+        self.state["started_at"] = "2026-11-01T00:00"
+        self.state["sent_today"] = 3
+        self.state["sent_day"] = "2026-11-10"
+        sent = []
+        with redirect_stdout(io.StringIO()):
+            self.make_loop(sent).beat_once()
+        self.assertEqual(sent, [])
+
+    def test_a_failed_send_does_not_count_toward_the_cap(self):
+        self.write_entry(weight=0.9)
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-09T20:00"
+        self.state["started_at"] = "2026-11-01T00:00"
+        sent = []
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(self.make_loop(sent, ok=False).beat_once())
+        self.assertEqual(self.state["sent_today"], 0)
+        self.assertIsNone(self.state["last_nudge_at"])
+
+    def test_no_sender_without_a_token(self):
+        os.environ.pop("FISH_TG_TOKEN", None)
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111"}
+        self.assertIsNone(bot.proactive_sender(self.cfg))
+
+
 if __name__ == "__main__":
     unittest.main()

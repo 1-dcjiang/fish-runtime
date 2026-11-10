@@ -479,7 +479,8 @@ def cmd_status(cfg: dict, state: dict, now: datetime) -> int:
     return 0
 
 
-def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
+def cmd_tick(cfg: dict, state: dict, now: datetime, send=None) -> int:
+    """One heartbeat. `send` overrides the configured channel — a bot needs the reply routed to a chat."""
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
     # a resident run keeps `state` in memory across beats, so a clock that jumps back mid-process must heal
@@ -499,7 +500,7 @@ def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
         text = adapters.ModelClient(cfg["model"], persona).compose(
             ref=ref, mood=mood, proactive=True, memory_lines=lines
         )
-        result = adapters.Channel(cfg["channel"]).send(text)
+        result = (send or adapters.Channel(cfg["channel"]).send)(text)
         if result.get("ok"):
             state["sent_today"] = int(state.get("sent_today", 0)) + 1
             state["sent_day"] = now.date().isoformat()

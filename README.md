@@ -79,6 +79,26 @@ Four guards, because an unattended bot is a different threat model from a CLI:
 Replies are chunked at the platform limit (Telegram 4096, Discord 2000) on newline/space boundaries, so a
 long answer does not get rejected with a 400.
 
+### Letting it speak first
+
+`proactive` turns the heartbeat on **inside** the bot: every `interval_seconds` the same `decide()` that
+`fish.py tick` uses runs, and when it says yes the line goes to `target`.
+
+```json
+"proactive": { "enabled": true, "platform": "telegram", "target": 123456789, "interval_seconds": 900 }
+```
+
+- **The target is whatever chat id you put there** — a group, a channel, or a DM. It must already appear in
+  that platform's allowlist, or `validate()` refuses to start: an unattended beat must not be able to speak
+  somewhere the allowlist would never have accepted a reply.
+- Quiet hours, the 20-minute gap since your last message, `max_messages_per_day`, the idle threshold and
+  "is anything strong enough to mention" all still apply. This is the CLI's `decide()`, not a second policy
+  that could drift from it.
+- Off by default. A bot that messages you first is a behaviour you opt into, not a default.
+
+Turns and beats share one `state` dict, so the process serialises them with a lock: a beat cannot interleave
+with the memory writes of a reply.
+
 What bot mode deliberately is not: no attachments, no voice, no embeds, no slash-command registration, no
 Discord resume (a disconnect re-identifies from scratch), and one polling process per token — Telegram's
 `getUpdates` conflicts with a configured webhook, so turn the webhook off first.
@@ -200,12 +220,14 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-79 tests, no network, no real clock. The 50 CLI cases plus 29 bot cases: config validation refusing to start
+87 tests, no network, no real clock. The 50 CLI cases plus 37 bot cases: config validation refusing to start
 without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
 parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
 Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gateway identify with the right
-intents, and WebSocket frame roundtrips at 7, 200 and 70,000 bytes.
+intents, WebSocket frame roundtrips at 7, 200 and 70,000 bytes, and the proactive beat: a target outside the
+allowlist refused at startup, an idle character speaking on its own, a recent message keeping it quiet, the
+daily cap, and a failed send not counting toward it.
 
 The 50 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
 format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still

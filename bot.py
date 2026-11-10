@@ -61,6 +61,9 @@ BOT_DEFAULTS = {
              "max_messages_per_day": 3, "min_weight": 0.5},
     "telegram": {"token_env": "FISH_TG_TOKEN", "allow_chat_ids": [], "allow_user_ids": []},
     "discord": {"token_env": "FISH_DISCORD_TOKEN", "allow_channel_ids": [], "allow_user_ids": []},
+    # Off by default: a bot that messages you first is a behaviour you opt into, and the target has to be
+    # one you already allowlisted — the config you write is the only thing that decides where it speaks.
+    "proactive": {"enabled": False, "platform": "", "target": "", "interval_seconds": 0},
     "limits": {"max_messages_per_minute": 6, "max_message_chars": 800},
 }
 
@@ -119,20 +122,39 @@ def validate(cfg: dict) -> list[str]:
         allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
         allow = []
         for key in allow_keys + ("allow_user_ids",):
-            allow.extend(section.get(key) or [])
+            allow.extend(str(v) for v in (section.get(key) or []))
         if not allow:
             problems.append(f"{platform}: no allowlist (refusing to answer strangers)")
+    proactive = cfg.get("proactive") or {}
+    if proactive.get("enabled"):
+        platform = proactive.get("platform") or ""
+        if platform not in {"telegram", "discord"}:
+            problems.append("proactive: platform must be telegram or discord")
+        elif platform not in platforms:
+            problems.append(f"proactive: platform {platform} is not in the platform list")
+        target = str(proactive.get("target") or "")
+        if not target:
+            problems.append("proactive: target chat/channel id is empty")
+        else:
+            allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
+            allow = []
+            for key in allow_keys + ("allow_user_ids",):
+                allow.extend(str(v) for v in ((cfg.get(platform) or {}).get(key) or []))
+            if target not in allow:
+                # an unattended beat must not speak somewhere the allowlist would never have accepted
+                problems.append(f"proactive: target {target} is not in the {platform} allowlist")
     return problems
 
 
 class Router:
     """Turns an incoming message into one reply. Commands are handled here, conversation goes to fish."""
 
-    def __init__(self, cfg: dict, state: dict, now_fn=None, compose=None):
+    def __init__(self, cfg: dict, state: dict, now_fn=None, compose=None, lock=None):
         self.cfg = cfg
         self.state = state
         self.now_fn = now_fn or (lambda: datetime.now().replace(microsecond=0))
         self.compose = compose or fish.compose_reply
+        self.lock = lock or threading.Lock()
         self.sent_at: dict[str, list[float]] = {}
 
     # ---- guards -------------------------------------------------------------------------------
@@ -200,11 +222,16 @@ class Router:
             return self._status_line()
         if lowered == "/verify":
             ids = [part for part in rest.split() if part]
-            return self._verify(ids) if ids else "usage: /verify m-YYYYMMDD-NN"
+            if not ids:
+                return "usage: /verify m-YYYYMMDD-NN"
+            with self.lock:
+                return self._verify(ids)
         if body.startswith("/"):
             return "unknown command — try /help"
-        turn = self.compose(self.cfg, self.state, self.now_fn(), body,
-                            record=bool(self.cfg.get("record_episodes") != "off"))
+        # one turn at a time: a heartbeat thread shares this state and may be mid-tick
+        with self.lock:
+            turn = self.compose(self.cfg, self.state, self.now_fn(), body,
+                                record=bool(self.cfg.get("record_episodes") != "off"))
         print(f"[bot] {platform} turn: recalled {', '.join(turn['hits']) or 'nothing'}, "
               f"episode {turn['episode'] or '-'}", file=sys.stderr)
         return turn["reply"]
@@ -218,6 +245,69 @@ def subprocess_run(command: list[str], timeout: int = 60) -> dict:
         return {"code": 1, "note": str(exc)}
     note = (result.stderr or result.stdout).strip().splitlines()
     return {"code": result.returncode, "note": note[0] if note else ""}
+
+
+def proactive_sender(cfg: dict):
+    """A callable that delivers one proactive line to the configured chat, or None when unconfigured."""
+    section = cfg.get("proactive") or {}
+    platform = section.get("platform")
+    target = section.get("target")
+    if platform == "telegram":
+        token = os.environ.get(cfg["telegram"].get("token_env", "FISH_TG_TOKEN"), "")
+        if not token or not target:
+            return None
+        return lambda text: adapters.send_telegram(token, target, text)
+    if platform == "discord":
+        token = os.environ.get(cfg["discord"].get("token_env", "FISH_DISCORD_TOKEN"), "")
+        if not token or not target:
+            return None
+        return lambda text: adapters.send_discord(token, target, text)
+    return None
+
+
+class BeatLoop:
+    """The heartbeat from `fish.py run`, wired to a chat: decide → maybe speak → cycle → persist.
+
+    Everything that decides *whether* it may speak (quiet hours, the 20-minute gap, the daily cap, idle
+    time, whether any memory is strong enough) stays in `fish.decide()`, so a bot beat and a CLI beat
+    cannot disagree. This class only supplies the transport and the loop.
+    """
+
+    def __init__(self, cfg: dict, state: dict, send, now_fn=None, lock=None,
+                 stop: threading.Event | None = None, interval: int | None = None):
+        self.cfg = cfg
+        self.state = state
+        self.send = send
+        self.now_fn = now_fn or (lambda: datetime.now().replace(microsecond=0))
+        self.lock = lock or threading.Lock()
+        self.stop = stop or threading.Event()
+        self.interval = interval or int(cfg["beat"].get("interval_seconds", 900))
+
+    def beat_once(self) -> bool:
+        delivered = []
+
+        def deliver(text: str) -> dict:
+            outcome = self.send(text)
+            if outcome.get("ok"):
+                delivered.append(text)
+            return outcome
+
+        with self.lock:
+            fish.cmd_tick(self.cfg, self.state, self.now_fn(), send=deliver)
+        return bool(delivered)
+
+    def run(self) -> int:
+        section = self.cfg.get("proactive") or {}
+        print(f"[beat] proactive every {self.interval}s to {section.get('platform')} "
+              f"{section.get('target')}", file=sys.stderr)
+        while not self.stop.is_set():
+            try:
+                self.beat_once()
+            except Exception as exc:
+                # a failed beat (network, a broken memory file) must not end the loop
+                print(f"[beat] tick failed: {exc}", file=sys.stderr)
+            self.stop.wait(self.interval)
+        return 0
 
 
 class TelegramBot:
@@ -414,7 +504,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     state = fish.load_state(Path(cfg["state_file"]))
-    router = Router(cfg, state)
+    stop = threading.Event()
+    lock = threading.Lock()  # a turn and a beat both rewrite state; one at a time
+    router = Router(cfg, state, lock=lock)
 
     try:
         if args.once:
@@ -426,12 +518,21 @@ def main(argv: list[str] | None = None) -> int:
             threads.append(threading.Thread(target=TelegramBot(cfg, router).run, daemon=True))
         if "discord" in platforms:
             threads.append(threading.Thread(target=DiscordBot(cfg, router).run, daemon=True))
+        if (cfg.get("proactive") or {}).get("enabled"):
+            sender = proactive_sender(cfg)
+            if sender:
+                threads.append(threading.Thread(
+                    target=BeatLoop(cfg, state, sender, lock=lock, stop=stop).run, daemon=True))
+            else:
+                print("warning: proactive is enabled but no sender could be built; beat not started",
+                      file=sys.stderr)
         for thread in threads:
             thread.start()
         print("[bot] running; Ctrl-C stops", file=sys.stderr)
         while any(thread.is_alive() for thread in threads):
             time.sleep(1)
     except KeyboardInterrupt:
+        stop.set()
         fish.save_state(Path(cfg["state_file"]), state)
         print("[bot] stopped", file=sys.stderr)
     return 0
