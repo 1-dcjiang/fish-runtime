@@ -11,6 +11,14 @@ next to this directory so `../persona-and-memory/` resolves.
 [Why this can't be listed as a skill](#why-this-cant-be-listed-as-a-skill) before you submit anything to a
 marketplace.
 
+**Prerequisite: the `persona-and-memory` skill itself.** This repo does not ship the persona card, the
+`memory_cycle.py` script, the memory file format or the decay/consolidation rules — it runs them. Get the
+skill from the marketplace listing
+([agensi.io/skills/persona-and-memory](https://www.agensi.io/skills/persona-and-memory), ZIP download),
+unzip it beside this directory, and point `persona`, `memory_root` and `cycle_script` at it. Without the
+skill, a beat has nothing to cycle and recall has nothing to rank; the runtime still starts, it just has no
+memory to be a character about.
+
 ```
 memory/  ← written by persona-and-memory (the skill)
    ↓ read
