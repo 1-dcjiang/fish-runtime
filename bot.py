@@ -54,6 +54,8 @@ BOT_DEFAULTS = {
     "state_file": "bot-state.json",
     "record_episodes": "auto",
     "run_cycle_on_tick": True,
+    # replies quote recalled memory by default — in a group too; set false to keep the store out of replies
+    "reply": {"include_memory": True},
     "model": {"mode": "offline"},
     "channel": {"type": "stdout"},
     "beat": {"interval_seconds": 900, "quiet_hours": [23, 7], "min_gap_minutes": 20,
@@ -101,12 +103,126 @@ def load_config(path: Path) -> dict:
     except json.JSONDecodeError as exc:
         print(f"error: config is not valid JSON: {exc}", file=sys.stderr)
         raise SystemExit(2)
+    if not isinstance(raw, dict):
+        # a list or a bare value would crash merge(); say so instead of throwing AttributeError
+        print(f"error: config must contain a JSON object, got {type(raw).__name__}", file=sys.stderr)
+        raise SystemExit(2)
     return fish.merge(fish.merge(fish.DEFAULTS, BOT_DEFAULTS), raw)
 
 
 def platforms_of(cfg: dict) -> list[str]:
     platforms = cfg.get("platform") or []
     return [platforms] if isinstance(platforms, str) else list(platforms)
+
+
+# The config is hand-editable JSON, so a wrong *shape* is a real failure mode: `beat.quiet_hours: 8` is not
+# a typo the runtime can shrug off, it makes every beat throw. One table, read by both validate() and
+# setup.py, so a value the configurator accepts is a value the runtime can use.
+TYPE_RULES = {
+    "beat.interval_seconds": ("int", 0, None),
+    "beat.quiet_hours": ("hours", None, None),
+    "beat.min_gap_minutes": ("int", 0, None),
+    "beat.nudge_after_hours": ("num", 0, None),
+    "beat.nudge_cooldown_hours": ("num", 0, None),
+    "beat.max_messages_per_day": ("int", 0, None),
+    "beat.min_weight": ("num", 0, 1),
+    "beat.include_memory": ("bool", None, None),
+    "limits.max_messages_per_minute": ("int", 1, None),
+    "limits.max_message_chars": ("int", 1, None),
+    "proactive.enabled": ("bool", None, None),
+    "proactive.platform": ("str", None, None),
+    "proactive.target": ("id", None, None),
+    "proactive.interval_seconds": ("int", 0, None),
+    "proactive.include_memory": ("bool", None, None),
+    "reply.include_memory": ("bool", None, None),
+    "telegram.allow_chat_ids": ("ids", None, None),
+    "telegram.allow_user_ids": ("ids", None, None),
+    "discord.allow_channel_ids": ("ids", None, None),
+    "discord.allow_user_ids": ("ids", None, None),
+    "telegram.token_env": ("str", None, None),
+    "discord.token_env": ("str", None, None),
+    "model.mode": ("str", None, None),
+    "model.timeout": ("int", 1, None),
+}
+
+TYPE_HINTS = {
+    "int": "a whole number",
+    "num": "a number",
+    "bool": "true or false",
+    "str": "a non-empty string",
+    "id": "a chat/user id (number or string)",
+    "hours": "two hours 0–23, like [23,7]",
+    "ids": "a list of ids, like [123456789]",
+}
+
+
+def value_of(cfg: dict, path: str):
+    if "." not in path:
+        return cfg.get(path)
+    root, leaf = path.split(".", 1)
+    section = cfg.get(root)
+    return section.get(leaf) if isinstance(section, dict) else None
+
+
+def check_type(path: str, value) -> str | None:
+    """`None` when the value has the shape the runtime needs, otherwise a sentence saying what it wanted."""
+    rule = TYPE_RULES.get(path)
+    if not rule:
+        return None
+    kind, low, high = rule
+    hint = TYPE_HINTS[kind]
+    if kind == "bool":
+        return None if isinstance(value, bool) else f"{path} must be {hint} (got {value!r})"
+    if kind == "str":
+        return None if isinstance(value, str) and value.strip() else \
+            f"{path} must be {hint} (got {value!r})"
+    if kind == "id":
+        return None if isinstance(value, (str, int)) and not isinstance(value, bool) else \
+            f"{path} must be {hint} (got {value!r})"
+    if kind == "hours":
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return f"{path} must be {hint} (got {value!r})"
+        for hour in value:
+            if not isinstance(hour, int) or isinstance(hour, bool) or not 0 <= hour <= 23:
+                return f"{path} must be {hint} (got {value!r})"
+        return None
+    if kind == "ids":
+        if not isinstance(value, (list, tuple)):
+            return f"{path} must be {hint} (got {value!r})"
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (str, int)):
+                return f"{path} must be {hint} (got {value!r})"
+        return None
+    if kind == "int":
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{path} must be {hint} (got {value!r})"
+    elif kind == "num":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return f"{path} must be {hint} (got {value!r})"
+    else:  # pragma: no cover - a rule added without a branch is a bug in this table
+        return f"{path}: unknown rule {kind}"
+    if low is not None and value < low:
+        return f"{path} must be at least {low} (got {value!r})"
+    if high is not None and value > high:
+        return f"{path} must be at most {high} (got {value!r})"
+    return None
+
+
+def type_problems(cfg: dict) -> list[str]:
+    problems = []
+    # with proactive off its fields are placeholders ("", 0) — validate() only checks them once enabled
+    proactive_on = bool((cfg.get("proactive") or {}).get("enabled"))
+    for path in TYPE_RULES:
+        if path.startswith("proactive.") and not proactive_on:
+            continue
+        value = value_of(cfg, path)
+        if value is None:
+            continue
+        problem = check_type(path, value)
+        if problem:
+            problems.append(problem)
+    return problems
+
 
 
 def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
@@ -116,6 +232,8 @@ def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
     target outside it is wrong the moment it is written.
     """
     problems: list[str] = []
+    # shape first: `beat.quiet_hours: 8` would otherwise pass this gate and throw on every beat
+    problems.extend(type_problems(cfg))
     platforms = platforms_of(cfg)
     for platform in platforms:
         section = cfg.get(platform)
@@ -131,7 +249,10 @@ def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
         allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
         allow = []
         for key in allow_keys + ("allow_user_ids",):
-            allow.extend(str(v) for v in (section.get(key) or []))
+            values = section.get(key) or []
+            if not isinstance(values, (list, tuple)):
+                continue  # already reported by type_problems; iterating an int would crash startup
+            allow.extend(str(v) for v in values)
         if not allow:
             problems.append(f"{platform}: no allowlist (refusing to answer strangers)")
     proactive = cfg.get("proactive") or {}
@@ -147,7 +268,8 @@ def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
         else:
             # only the chat/channel list counts here: a user id is not a place a beat may speak
             allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
-            allow = [str(v) for v in ((cfg.get(platform) or {}).get(allow_keys[0]) or [])]
+            listed = (cfg.get(platform) or {}).get(allow_keys[0]) or []
+            allow = [str(v) for v in listed] if isinstance(listed, (list, tuple)) else []
             if target not in allow:
                 # an unattended beat must not speak somewhere the allowlist would never have accepted
                 problems.append(f"proactive: target {target} is not in the {platform} allowlist")
@@ -174,13 +296,21 @@ class Router:
         self.sent_at: dict[str, list[float]] = {}
 
     # ---- guards -------------------------------------------------------------------------------
-    def allowed(self, platform: str, chat_id, user_id) -> bool:
+    def allowed(self, platform: str, chat_id, user_id, private: bool = True) -> bool:
         section = self.cfg.get(platform) or {}
-        allow = []
-        for key in ("allow_chat_ids", "allow_channel_ids", "allow_user_ids"):
-            allow.extend(str(v) for v in (section.get(key) or []))
+        chat_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
+        chats, users = [], []
+        for key in chat_keys + ("allow_user_ids",):
+            values = section.get(key) or []
+            if not isinstance(values, (list, tuple)):
+                continue
+            (users if key == "allow_user_ids" else chats).extend(str(v) for v in values)
         # an empty allowlist is a configuration error (validate() refuses to start), not "allow all"
-        return bool(allow) and (str(chat_id) in allow or str(user_id) in allow)
+        if str(chat_id) in chats:
+            return True
+        # a trusted user is trusted in a private chat, not "anywhere this person happens to speak": with
+        # the old or-logic, one id in allow_user_ids answered them in every group they joined
+        return bool(private) and str(user_id) in users
 
     def rate_limited(self, chat_id) -> bool:
         limit = int(self.cfg["limits"].get("max_messages_per_minute", 6))
@@ -220,9 +350,9 @@ class Router:
         fish.save_state(Path(self.cfg["state_file"]), self.state)
         return f"confirmed: {', '.join(ids)} (mood +{fish.MOOD_VERIFY_RISE})"
 
-    def handle(self, platform: str, chat_id, user_id, text: str) -> str | None:
+    def handle(self, platform: str, chat_id, user_id, text: str, private: bool = True) -> str | None:
         body = (text or "").strip()
-        if not body or not self.allowed(platform, chat_id, user_id):
+        if not body or not self.allowed(platform, chat_id, user_id, private):
             return None
         with self.lock:
             # two platform threads share this counter table; a read-modify-write outside the lock can
@@ -235,7 +365,8 @@ class Router:
         limit = int(self.cfg["limits"].get("max_message_chars", 800))
         body = body[:limit]
         command, _, rest = body.partition(" ")
-        lowered = command.lower()
+        # Telegram appends the bot name in groups (`/status@fish_bot`); no other platform does
+        lowered = command.split("@", 1)[0].lower()
         if lowered in {"/start", "/help"}:
             return HELP
         if lowered == "/status":
@@ -249,11 +380,17 @@ class Router:
         if body.startswith("/"):
             return "unknown command — try /help"
         # one turn at a time: a heartbeat thread shares this state and may be mid-tick
+        # quoting is on by default, including in groups — one switch (`reply.include_memory`) turns it off
+        # everywhere, and the log line says which mode this turn used
+        quote = bool((self.cfg.get("reply") or {}).get("include_memory", True))
         with self.lock:
             turn = self.compose(self.cfg, self.state, self.now_fn(), body,
-                                record=bool(self.cfg.get("record_episodes") != "off"))
+                                record=bool(self.cfg.get("record_episodes") != "off"),
+                                include_memory=quote)
+        where = "" if private else " in a group"
         print(f"[bot] {platform} turn: recalled {', '.join(turn['hits']) or 'nothing'}, "
-              f"episode {turn['episode'] or '-'}", file=sys.stderr)
+              f"episode {turn['episode'] or '-'}, memory quoting "
+              f"{'on' if quote else 'off'}{where}", file=sys.stderr)
         return turn["reply"]
 
 
@@ -335,6 +472,11 @@ class BeatLoop:
         return 0
 
 
+def backoff(delay: float) -> float:
+    """Next wait after a failed poll: 2s, 4s, 8s … capped. A bad token must not become a 1 Hz request loop."""
+    return min(30.0, max(2.0, delay * 2))
+
+
 class TelegramBot:
     """Long polling. No webhook, so it works behind NAT and needs no public address."""
 
@@ -345,6 +487,7 @@ class TelegramBot:
         self.send = send or adapters.send_telegram
         self.token = os.environ.get(cfg["telegram"].get("token_env", "FISH_TG_TOKEN"), "")
         self.state = router.state
+        self.poll_ok = True
 
     def poll_once(self) -> int:
         try:
@@ -360,7 +503,9 @@ class TelegramBot:
         if not data.get("ok"):
             print(f"[telegram] poll failed: {data.get('error') or data.get('description')}",
                   file=sys.stderr)
+            self.poll_ok = False
             return 0
+        self.poll_ok = True
         handled = 0
         for update in data.get("result") or []:
             self.state["telegram_offset"] = int(update.get("update_id", 0)) + 1
@@ -384,7 +529,9 @@ class TelegramBot:
             return False
         chat_id = (message.get("chat") or {}).get("id")
         user_id = (message.get("from") or {}).get("id")
-        reply = self.router.handle("telegram", chat_id, user_id, text)
+        # "private" is what separates a DM from a group: the same id set means different reach in each
+        private = (message.get("chat") or {}).get("type") == "private"
+        reply = self.router.handle("telegram", chat_id, user_id, text, private=private)
         if not reply:
             return False
         for chunk in adapters.split_message(reply, adapters.TELEGRAM_LIMIT):
@@ -396,6 +543,7 @@ class TelegramBot:
 
     def run(self) -> int:
         print("[telegram] polling as configured", file=sys.stderr)
+        delay = 1.0
         while True:
             try:
                 self.poll_once()
@@ -404,8 +552,10 @@ class TelegramBot:
             except Exception as exc:
                 # a single bad poll (DNS, 502, a rotated token) must not kill the process
                 print(f"[telegram] poll error: {exc}", file=sys.stderr)
-                time.sleep(3)
-            time.sleep(1)
+                self.poll_ok = False
+            # a rejected token or two processes racing getUpdates must not become a request loop
+            delay = 1.0 if self.poll_ok else backoff(delay)
+            time.sleep(delay)
 
 
 class DiscordBot:
@@ -463,12 +613,13 @@ class DiscordBot:
         if not content:
             return None
         channel_id = message.get("channel_id")
+        private = not message.get("guild_id")
         # In a guild, only answer when addressed: "@bot ..." or a leading command.
-        if message.get("guild_id") and not content.startswith("<@") and not content.startswith("/"):
+        if not private and not content.startswith("<@") and not content.startswith("/"):
             return None
         if content.startswith("<@"):
             content = content.split(">", 1)[-1].strip()
-        reply = self.router.handle("discord", channel_id, author.get("id"), content)
+        reply = self.router.handle("discord", channel_id, author.get("id"), content, private=private)
         if not reply:
             return None
         for chunk in adapters.split_message(reply, adapters.DISCORD_LIMIT):

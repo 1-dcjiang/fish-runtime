@@ -12,6 +12,7 @@ import os
 import socket
 import ssl
 import struct
+import threading
 from urllib.parse import urlsplit
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -95,6 +96,9 @@ class WebSocket:
         self.timeout = timeout
         self.sock: socket.socket | None = None
         self._buffer = b""
+        # the Discord heartbeat thread and the reply thread share this socket; two interleaved sendall
+        # calls can produce a broken frame, which the gateway answers by reconnecting
+        self._write_lock = threading.Lock()
 
     def connect(self) -> "WebSocket":
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
@@ -140,9 +144,10 @@ class WebSocket:
             raise WebSocketError("bad Sec-WebSocket-Accept")
 
     def _send_frame(self, payload: bytes, opcode: int) -> None:
-        if not self.sock:
-            raise WebSocketError("not connected")
-        self.sock.sendall(build_frame(payload, opcode))
+        with self._write_lock:
+            if not self.sock:
+                raise WebSocketError("not connected")
+            self.sock.sendall(build_frame(payload, opcode))
 
     def send(self, text: str) -> None:
         self._send_frame(text.encode("utf-8"), OP_TEXT)

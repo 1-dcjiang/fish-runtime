@@ -30,7 +30,7 @@ DEFAULT_CONFIG = "config.bot.json"
 # silently ignored by the runtime (the classic "documented key nobody reads" failure).
 SCALARS = {
     "platform", "persona", "memory_root", "state_file", "cycle_script", "record_episodes",
-    "model.mode", "model.model", "model.base_url", "model.api_key_env",
+    "model.mode", "model.model", "model.base_url", "model.api_key_env", "model.timeout",
     "channel.type", "channel.url", "channel.token_env", "channel.chat_id_env",
 }
 SECTIONS = {
@@ -40,7 +40,8 @@ SECTIONS = {
              "nudge_cooldown_hours", "max_messages_per_day", "min_weight", "include_memory"},
     "limits": {"max_messages_per_minute", "max_message_chars"},
     "proactive": {"enabled", "platform", "target", "interval_seconds", "include_memory"},
-    "model": {"mode", "model", "name", "base_url", "api_key_env"},
+    "reply": {"include_memory"},
+    "model": {"mode", "model", "name", "base_url", "api_key_env", "timeout"},
     "channel": {"type", "url", "token_env", "chat_id_env"},
 }
 
@@ -104,6 +105,11 @@ def apply_assignment(cfg: dict, assignment: str) -> tuple[str, object, object]:
     check_path(key)
     before = current(cfg, key)
     value = parse_value(raw.strip())
+    # a shape mismatch is a bad *value*, not an invalid configuration: exit 3, nothing written. This is
+    # the same table bot.validate() reads, so "setup accepted it" and "the runtime can use it" agree.
+    problem = bot.check_type(key, value)
+    if problem:
+        raise ConfigError(3, problem)
     if "." in key:
         root, leaf = key.split(".", 1)
         section = cfg.get(root)
@@ -165,6 +171,9 @@ def describe(cfg: dict) -> str:
                      f"memory quotes {'on' if proactive.get('include_memory') else 'off'}")
     else:
         lines.append("proactive: off (it never speaks first)")
+    reply = cfg.get("reply") or {}
+    lines.append(f"replies: {'quote recalled memory' if reply.get('include_memory', True) else 'never quote memory'}"
+                 " (groups included unless turned off)")
     limits = cfg["limits"]
     lines.append(f"limits: {limits.get('max_messages_per_minute')} replies/min per chat, "
                  f"incoming text cut at {limits.get('max_message_chars')} chars")

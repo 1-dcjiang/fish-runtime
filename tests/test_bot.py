@@ -114,6 +114,14 @@ class ValidateTests(BotFixture):
         self.assertIn("FISH_TG_TOKEN is unset", joined)
         self.assertIn("no allowlist", joined)
 
+    def test_a_bad_shape_is_reported_instead_of_crashing_the_beat(self):
+        self.cfg["beat"]["quiet_hours"] = 8
+        self.cfg["telegram"]["allow_chat_ids"] = 123456
+        problems = bot.validate(self.cfg)
+        joined = " | ".join(problems)
+        self.assertIn("beat.quiet_hours must be two hours", joined)
+        self.assertIn("telegram.allow_chat_ids must be a list of ids", joined)
+
     def test_a_complete_config_has_no_problems(self):
         self.assertEqual(bot.validate(self.cfg), [])
 
@@ -155,6 +163,42 @@ class RouterTests(BotFixture):
         router = self.router(compose=lambda *a, **k: {"reply": "x", "hits": [], "episode": None})
         self.assertIn("unknown command", router.handle("telegram", "111", "5", "/frobnicate"))
 
+    def test_a_group_command_with_the_bot_suffix_still_works(self):
+        self.write_entry()
+        self.build_index()
+        router = self.router()
+        line = router.handle("telegram", "111", "5", "/status@fish_bot", private=False)
+        self.assertIn("1 entries", line)
+
+    def test_group_replies_quote_memory_by_default(self):
+        seen = {}
+
+        def compose(cfg, state, now, text, record=True, include_memory=True):
+            seen["quote"] = include_memory
+            return {"reply": "ok", "hits": [], "episode": None}
+
+        router = self.router(compose=compose)
+        router.handle("telegram", "111", "5", "还记得吗", private=False)
+        self.assertIs(seen["quote"], True)
+
+    def test_the_switch_turns_quoting_off_everywhere(self):
+        seen = {}
+
+        def compose(cfg, state, now, text, record=True, include_memory=True):
+            seen["quote"] = include_memory
+            return {"reply": "ok", "hits": [], "episode": None}
+
+        self.cfg["reply"] = {"include_memory": False}
+        router = self.router(compose=compose)
+        router.handle("telegram", "111", "5", "还记得吗", private=False)
+        self.assertIs(seen["quote"], False)
+
+    def test_a_trusted_user_is_not_trusted_in_an_unlisted_group(self):
+        self.cfg["telegram"]["allow_user_ids"] = ["5"]
+        router = self.router(compose=lambda *a, **k: {"reply": "ok", "hits": [], "episode": None})
+        self.assertIsNone(router.handle("telegram", "777", "5", "hi", private=False))
+        self.assertEqual(router.handle("telegram", "777", "5", "hi", private=True), "ok")
+
     def test_rate_limit_drops_the_seventh_message(self):
         router = self.router(compose=lambda *a, **k: {"reply": "ok", "hits": [], "episode": None})
         replies = [router.handle("telegram", "111", "5", f"m{i}") for i in range(8)]
@@ -164,7 +208,7 @@ class RouterTests(BotFixture):
     def test_long_input_is_truncated_before_memory(self):
         seen = {}
 
-        def compose(cfg, state, now, text, record=True):
+        def compose(cfg, state, now, text, record=True, include_memory=True):
             seen["text"] = text
             return {"reply": "ok", "hits": [], "episode": None}
 
@@ -184,9 +228,9 @@ class TelegramTests(BotFixture):
                                send=lambda token, chat, text: sent.append((chat, text)) or {"ok": True})
         return bot_, http, sent
 
-    def update(self, text="hello", chat="111", user="5", bot_flag=False):
+    def update(self, text="hello", chat="111", user="5", bot_flag=False, chat_type="private"):
         return {"update_id": 77, "message": {"text": text,
-                                             "chat": {"id": chat},
+                                             "chat": {"id": chat, "type": chat_type},
                                              "from": {"id": user, "is_bot": bot_flag}}}
 
     def test_a_text_message_is_answered_and_the_offset_advances(self):
@@ -213,6 +257,28 @@ class TelegramTests(BotFixture):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(b.poll_once(), 0)
         self.assertEqual(sent, [])
+        self.assertFalse(b.poll_ok)
+
+    def test_a_failed_poll_backs_off_instead_of_hammering_the_api(self):
+        self.assertEqual(bot.backoff(1), 2)
+        self.assertEqual(bot.backoff(2), 4)
+        self.assertEqual(bot.backoff(60), 30)
+
+    def test_a_group_message_is_answered_and_counts_as_a_group_turn(self):
+        seen = {}
+
+        def compose(cfg, state, now, text, record=True, include_memory=True):
+            seen["quote"] = include_memory
+            return {"reply": "在", "hits": [], "episode": None}
+
+        self.cfg["telegram"]["allow_chat_ids"] = ["111", "-100999"]
+        router = bot.Router(self.cfg, self.state, now_fn=lambda: fish.parse_now(self.now),
+                            compose=compose)
+        b, _http, sent = self.make_bot([{"ok": True, "result": [
+            self.update("在吗", chat="-100999", chat_type="group")]}], router=router)
+        b.poll_once()
+        self.assertEqual(sent[0][0], "-100999")
+        self.assertIs(seen["quote"], True)
 
     def test_a_corrupt_offset_does_not_wedge_polling(self):
         self.state["telegram_offset"] = "abc"

@@ -90,6 +90,17 @@ class SetupTests(unittest.TestCase):
         self.assertIn("proactive: off", out)
         self.assertIn("every 15 min", out)
 
+    def test_a_wrong_shape_is_a_bad_value_not_a_bad_config(self):
+        code, _out, err = self.run_setup("set", "beat.quiet_hours=8")
+        self.assertEqual(code, 3)
+        self.assertIn("two hours", err)
+        self.assertFalse(self.config.exists())
+
+    def test_a_bare_id_where_a_list_belongs_is_refused_with_the_bracketed_form(self):
+        code, _out, err = self.run_setup("set", "telegram.allow_chat_ids=123456")
+        self.assertEqual(code, 3)
+        self.assertIn("[123456789]", err)
+
     def test_a_corrupt_config_is_reported_not_crashed(self):
         self.config.write_text("{not json", encoding="utf-8")
         code, _out, err = self.run_setup("show")

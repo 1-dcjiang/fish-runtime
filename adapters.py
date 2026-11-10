@@ -39,14 +39,22 @@ def offline_reply(persona: dict, ref: str, mood: float, proactive: bool, seed: i
     name_self = persona.get("self", "I")
     user = persona.get("user", "you")
     flourish = (persona.get("flourish") or [""])[0]
+    empty = not (ref or "").strip()
 
     if zh:
-        if proactive:
+        if empty:
+            # no hit is not half a sentence: it is a complete, memory-free line
+            body = f"{user}，{lead}这条我这儿没有，你说给我听。" if proactive \
+                else f"{lead}这条我记不清了，你再说一遍。"
+        elif proactive:
             body = f"{user}，{lead}{ref}"
         else:
             body = f"{lead}{ref}"
     else:
-        if proactive:
+        if empty:
+            body = f"{user} — {lead} nothing on that in here; tell me." if proactive \
+                else f"{lead} nothing on that in here; tell me."
+        elif proactive:
             body = f"{user} — {lead} {ref}"
         else:
             body = f"{lead} {ref}"

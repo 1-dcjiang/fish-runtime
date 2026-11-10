@@ -530,11 +530,15 @@ def cmd_tick(cfg: dict, state: dict, now: datetime, send=None) -> int:
 
 
 def compose_reply(cfg: dict, state: dict, now: datetime, text: str,
-                  record: bool = True) -> dict:
+                  record: bool = True, include_memory: bool = True) -> dict:
     """Everything one turn needs except the transport: recall, reply text, and the memory writes.
 
     The transport (stdout, Telegram, a bot) only sends `reply`; all state changes happen here so a
     CLI turn and a chat turn cannot drift apart.
+
+    `include_memory=False` keeps the recalled text out of the prompt and out of `ref` — a reply in a
+    channel is read by everyone in it, so quoting a stored memory there is the same leak a careless
+    beat would be. The turn is still recalled and still recorded; only the quoting stops.
     """
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
@@ -547,10 +551,11 @@ def compose_reply(cfg: dict, state: dict, now: datetime, text: str,
     mood = min(1.0, mood_now(state, now) + MOOD_USER_BOOST)
 
     reply = adapters.ModelClient(cfg["model"], persona).compose(
-        ref=hits[0]["text"][:90] if hits else "",
+        ref=hits[0]["text"][:90] if hits and include_memory else "",
         mood=mood,
         proactive=False,
-        memory_lines=[f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in hits],
+        memory_lines=[f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in hits]
+        if include_memory else [],
         user_text=text,
     )
 

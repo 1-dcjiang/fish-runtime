@@ -64,21 +64,33 @@ Setup, in the order that actually matters:
 | Discord | Developer Portal → New Application → Bot → **enable MESSAGE CONTENT INTENT** → invite with `bot` scope → copy the channel id (right-click → Copy ID with Developer Mode on); put it in `allow_channel_ids` |
 
 `config.bot.example.json` is the whole surface: `platform`, the same `persona`/`memory_root`/`cycle_script`
-as the CLI, per-platform `token_env` + allowlists, `beat`, `limits`, and `proactive`. IDs are compared as
-strings, so quoting a snowflake id in JSON is harmless. You do not have to edit it by hand — see below.
+as the CLI, per-platform `token_env` + allowlists, `beat`, `limits`, `proactive` and `reply`. IDs are compared
+as strings, so quoting a snowflake id in JSON is harmless. You do not have to edit it by hand — see below.
 
 Four guards, because an unattended bot is a different threat model from a CLI:
 
 - **No allowlist, no start.** `validate()` refuses to boot without one — the failure mode of a public bot
   that answers everyone is not "noisy", it is "someone else controls your persona's mouth".
 - **Bot authors are ignored**, so two bots cannot loop on each other.
-- **Guild messages need a mention** (`<@bot>` or a leading `/`); DMs are answered directly.
+- **Guild messages need a mention** (`<@bot>` or a leading `/`); DMs are answered directly. Group commands
+  carry the bot name (`/status@fish_bot`) and are parsed anyway.
+- **A user id on the allowlist is trusted in a DM only.** Otherwise one id would answer that person in every
+  group they join, including groups the allowlist never accepted.
 - **Rate limit per chat** (`limits.max_messages_per_minute`, default 6/min) and a hard `max_message_chars`
   truncation before anything reaches memory. Tokens come from the environment, and message bodies never
   appear in logs — only ids, counts and `recalled …`.
 
 Replies are chunked at the platform limit (Telegram 4096, Discord 2000) on newline/space boundaries, so a
 long answer does not get rejected with a 400.
+
+**Replies do quote recalled memory, in groups too** (`reply.include_memory: true`). That is deliberate: a
+bot with a personality that forgets everything the moment a second person walks in is not the thing this
+package is for. It does mean a memory like "you dislike being called late" can be spoken to a whole channel.
+One switch turns it off everywhere — say it and an assistant sets it:
+
+```bash
+python setup.py set reply.include_memory=false
+```
 
 ### Configure it by talking, not by editing JSON
 
@@ -92,6 +104,7 @@ then writes — so an assistant can turn one sentence into config:
 | 每天最多说 2 条 | `python setup.py set beat.max_messages_per_day=2` |
 | 发到这个群 123456 | `python setup.py set proactive.enabled=true proactive.platform=telegram proactive.target=123456 telegram.allow_chat_ids=[123456]` |
 | 私聊里可以提记忆 | `python setup.py set proactive.include_memory=true` |
+| 群里别把记忆念出来 | `python setup.py set reply.include_memory=false` |
 | 陌生人别回 | `python setup.py set telegram.allow_chat_ids=[123456]` |
 | 每分钟最多回 6 条 | `python setup.py set limits.max_messages_per_minute=6` |
 
@@ -99,6 +112,10 @@ Guarantees the tool gives an assistant, so a sentence cannot be configured into 
 
 - **Unknown keys are refused** (`exit 3`) with the real keys listed. A typo would otherwise be a setting the
   runtime never reads.
+- **A wrong shape is refused** (`exit 3`) with the shape it wanted: `beat.quiet_hours=8` says "must be two
+  hours 0–23, like [23,7]", `telegram.allow_chat_ids=123456` says "must be a list of ids, like [123456789]".
+  This is the same table `bot.validate()` reads, so "the configurator accepted it" and "the runtime can use
+  it" cannot disagree.
 - **Invalid combinations are refused** (`exit 2`) and **the previous file is left byte-identical** — a beat
   target outside the allowlist, or a user id used as a target, never lands on disk.
 - Values are parsed as JSON when they parse (`true`, `1200`, `[23,7]`) and kept as a bare string otherwise,
@@ -121,9 +138,11 @@ Guarantees the tool gives an assistant, so a sentence cannot be configured into 
 - Quiet hours, the 20-minute gap since your last message, `max_messages_per_day`, the idle threshold and
   "is anything strong enough to mention" all still apply. This is the CLI's `decide()`, not a second policy
   that could drift from it.
-- **A beat does not quote a stored memory by default** (`include_memory: false`). A beat can land in a group,
-  and a line like "I remember you are a first-year student in Suzhou" would leak that to everyone in the
-  room. Turn it on only when `target` is a private chat.
+- **A beat does not quote a stored memory by default** (`beat.include_memory: false`), while a *reply*
+  does (`reply.include_memory: true`). The two are separate on purpose: a beat can land in a group with
+  nobody having asked anything, so silence is the safer default there; a reply is an answer to a person in
+  the room, and remembering out loud is the point of the character. Turn the reply side off with one
+  `setup.py set reply.include_memory=false` if the channel is more public than you want.
 - Off by default. A bot that messages you first is a behaviour you opt into, not a default.
 
 Turns and beats share one `state` dict, so the process serialises them with a lock: a beat cannot interleave
@@ -250,19 +269,23 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-102 tests, no network, no real clock. The 50 CLI cases, 43 bot cases and 9 configurator cases: config
+111 tests, no network, no real clock. 50 CLI cases, 50 bot cases and 11 configurator cases: config
 validation refusing to start
-without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
+without a token or an allowlist, a wrong shape reported instead of crashing a beat, strangers ignored, a
+trusted user id not trusted in an unlisted group, `/help` not touching memory, `/status` reporting counts,
+`/status@fish_bot` parsed in groups, replies quoting memory by default and the one switch turning that off,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
-parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
+parsing (bot authors, edits, poll failures, offset advancing, a failed poll backing off instead of hammering
+the API), reply splitting under both platform limits,
 Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gateway identify with the right
 intents, WebSocket frame roundtrips at 7, 200 and 70,000 bytes, and the proactive beat: a target outside the
 allowlist refused at startup, a user id not accepted as a target, a memory-free beat by default, opt-in
 memory quoting, a recent message keeping it quiet, the daily cap, a failed send not counting toward it, a
 corrupt `telegram_offset` recovering instead of wedging polling, and a spinning interval clamped. The
-configurator cases cover typed values, a bare token name, unknown keys refused with nothing written, an
-invalid target leaving the old file byte-identical, a missing token not blocking the write, `show` describing
-the effective behaviour, and a corrupt config reported instead of crashed.
+configurator cases cover typed values, a bare token name, unknown keys refused with nothing written, a wrong
+shape refused with the wanted form, an invalid target leaving the old file byte-identical, a missing token
+not blocking the write, `show` describing the effective behaviour, and a corrupt config reported instead of
+crashed.
 
 The 50 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
 format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still

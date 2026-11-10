@@ -5,6 +5,7 @@
   "state_file": "bot-state.json",
   "cycle_script": "../persona-and-memory/scripts/memory_cycle.py",
   "record_episodes": "auto",
+  "reply": { "include_memory": true },
   "model": { "mode": "offline" },
   "beat": {
     "interval_seconds": 900,
