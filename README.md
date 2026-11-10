@@ -1,8 +1,9 @@
 # fish-runtime
 
-A resident runtime for [`persona-and-memory`](https://github.com/1-dcjiang/persona-and-memory): it gives an
+A resident runtime for the `persona-and-memory` skill — it gives an
 assistant a heartbeat, a mood derived from memory events, and a channel to speak through — on top of the
-same `memory/` folder the skill already maintains.
+same `memory/` folder the skill already maintains. The skill is distributed as a ZIP (marketplace listing or
+its own archive), not as a repo; unzip it next to this directory so `../persona-and-memory/` resolves.
 
 **This is not a skill, and it is deliberately not packaged as one.** See
 [Why this can't be listed as a skill](#why-this-cant-be-listed-as-a-skill) before you submit anything to a
