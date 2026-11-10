@@ -6,6 +6,15 @@
   "cycle_script": "../persona-and-memory/scripts/memory_cycle.py",
   "record_episodes": "auto",
   "model": { "mode": "offline" },
+  "beat": {
+    "interval_seconds": 900,
+    "quiet_hours": [23, 7],
+    "min_gap_minutes": 20,
+    "nudge_after_hours": 6,
+    "nudge_cooldown_hours": 12,
+    "max_messages_per_day": 3,
+    "min_weight": 0.5
+  },
   "telegram": {
     "token_env": "FISH_TG_TOKEN",
     "allow_chat_ids": [123456789],

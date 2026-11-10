@@ -2,9 +2,10 @@
 
 A resident runtime for the `persona-and-memory` skill — it gives an assistant a heartbeat, a mood derived
 from memory events, and a channel to speak through — on top of the same `memory/` folder the skill already
-maintains. Two entry points: `fish.py` for the CLI and the heartbeat, `bot.py` for a bot you leave running on
-Telegram and Discord. The skill is distributed as a ZIP (marketplace listing or its own archive), not as a
-repo; unzip it next to this directory so `../persona-and-memory/` resolves.
+maintains. Three scripts: `fish.py` for the CLI and the heartbeat, `bot.py` for a bot you leave running on
+Telegram and Discord, and `setup.py` to write the config from typed `key=value` pairs instead of hand-editing
+JSON. The skill is distributed as a ZIP (marketplace listing or its own archive), not as a repo; unzip it
+next to this directory so `../persona-and-memory/` resolves.
 
 **This is not a skill, and it is deliberately not packaged as one.** See
 [Why this can't be listed as a skill](#why-this-cant-be-listed-as-a-skill) before you submit anything to a
@@ -63,8 +64,8 @@ Setup, in the order that actually matters:
 | Discord | Developer Portal → New Application → Bot → **enable MESSAGE CONTENT INTENT** → invite with `bot` scope → copy the channel id (right-click → Copy ID with Developer Mode on); put it in `allow_channel_ids` |
 
 `config.bot.example.json` is the whole surface: `platform`, the same `persona`/`memory_root`/`cycle_script`
-as the CLI, per-platform `token_env` + allowlists, and `limits`. IDs are compared as strings, so quoting a
-snowflake id in JSON is harmless.
+as the CLI, per-platform `token_env` + allowlists, `beat`, `limits`, and `proactive`. IDs are compared as
+strings, so quoting a snowflake id in JSON is harmless. You do not have to edit it by hand — see below.
 
 Four guards, because an unattended bot is a different threat model from a CLI:
 
@@ -78,6 +79,32 @@ Four guards, because an unattended bot is a different threat model from a CLI:
 
 Replies are chunked at the platform limit (Telegram 4096, Discord 2000) on newline/space boundaries, so a
 long answer does not get rejected with a 400.
+
+### Configure it by talking, not by editing JSON
+
+Nobody should hand-edit this file. `setup.py` takes typed `key=value` assignments, validates them, and only
+then writes — so an assistant can turn one sentence into config:
+
+| You say | It runs |
+|---|---|
+| 每 20 分钟醒一次 | `python setup.py set proactive.interval_seconds=1200` |
+| 只在 8 点到 22 点之间说话 | `python setup.py set beat.quiet_hours=[8,22]` |
+| 每天最多说 2 条 | `python setup.py set beat.max_messages_per_day=2` |
+| 发到这个群 123456 | `python setup.py set proactive.enabled=true proactive.platform=telegram proactive.target=123456 telegram.allow_chat_ids=[123456]` |
+| 私聊里可以提记忆 | `python setup.py set proactive.include_memory=true` |
+| 陌生人别回 | `python setup.py set telegram.allow_chat_ids=[123456]` |
+| 每分钟最多回 6 条 | `python setup.py set limits.max_messages_per_minute=6` |
+
+Guarantees the tool gives an assistant, so a sentence cannot be configured into a quiet mistake:
+
+- **Unknown keys are refused** (`exit 3`) with the real keys listed. A typo would otherwise be a setting the
+  runtime never reads.
+- **Invalid combinations are refused** (`exit 2`) and **the previous file is left byte-identical** — a beat
+  target outside the allowlist, or a user id used as a target, never lands on disk.
+- Values are parsed as JSON when they parse (`true`, `1200`, `[23,7]`) and kept as a bare string otherwise,
+  so `telegram.token_env=FISH_TG_TOKEN` needs no quoting.
+- `show` prints what the bot will actually do in words ("every 15 min, quiet 22:00–08:00, at most 2/day");
+  `check` is exactly the gate `bot.py` runs at startup, so "it passes" means "it can start".
 
 ### Letting it speak first
 
@@ -223,7 +250,8 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-93 tests, no network, no real clock. The 50 CLI cases plus 43 bot cases: config validation refusing to start
+102 tests, no network, no real clock. The 50 CLI cases, 43 bot cases and 9 configurator cases: config
+validation refusing to start
 without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
 parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
@@ -231,7 +259,10 @@ Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gatewa
 intents, WebSocket frame roundtrips at 7, 200 and 70,000 bytes, and the proactive beat: a target outside the
 allowlist refused at startup, a user id not accepted as a target, a memory-free beat by default, opt-in
 memory quoting, a recent message keeping it quiet, the daily cap, a failed send not counting toward it, a
-corrupt `telegram_offset` recovering instead of wedging polling, and a spinning interval clamped.
+corrupt `telegram_offset` recovering instead of wedging polling, and a spinning interval clamped. The
+configurator cases cover typed values, a bare token name, unknown keys refused with nothing written, an
+invalid target leaving the old file byte-identical, a missing token not blocking the write, `show` describing
+the effective behaviour, and a corrupt config reported instead of crashed.
 
 The 50 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
 format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still

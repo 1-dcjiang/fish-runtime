@@ -104,12 +104,19 @@ def load_config(path: Path) -> dict:
     return fish.merge(fish.merge(fish.DEFAULTS, BOT_DEFAULTS), raw)
 
 
-def validate(cfg: dict) -> list[str]:
-    """Refuse to start on anything that would make the bot answer strangers or fail silently."""
-    problems: list[str] = []
+def platforms_of(cfg: dict) -> list[str]:
     platforms = cfg.get("platform") or []
-    if isinstance(platforms, str):
-        platforms = [platforms]
+    return [platforms] if isinstance(platforms, str) else list(platforms)
+
+
+def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
+    """Refuse to start on anything that would make the bot answer strangers or fail silently.
+
+    `require_tokens=False` is for the configurator: a token is exported later, but a wrong allowlist or a
+    target outside it is wrong the moment it is written.
+    """
+    problems: list[str] = []
+    platforms = platforms_of(cfg)
     for platform in platforms:
         section = cfg.get(platform)
         if platform not in {"telegram", "discord"}:
@@ -118,7 +125,7 @@ def validate(cfg: dict) -> list[str]:
         if not isinstance(section, dict):
             problems.append(f"{platform}: config section missing")
             continue
-        if not os.environ.get(section.get("token_env", ""), ""):
+        if require_tokens and not os.environ.get(section.get("token_env", ""), ""):
             problems.append(f"{platform}: environment variable "
                             f"{section.get('token_env') or '(none)'} is unset")
         allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
@@ -528,6 +535,8 @@ def main(argv: list[str] | None = None) -> int:
         for problem in problems:
             print(f"error: {problem}", file=sys.stderr)
         print("error: refusing to start (fix the items above; tokens go in the environment)",
+              file=sys.stderr)
+        print("hint: `python setup.py show` explains the current settings, `python setup.py set ...` edits them",
               file=sys.stderr)
         return 2
 
