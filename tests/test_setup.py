@@ -114,6 +114,36 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("can start", out)
 
+    def test_a_group_can_be_configured_on_its_own(self):
+        code, _out, err = self.run_setup("set", "platform=[\"telegram\"]",
+                                         "telegram.allow_chat_ids=[111,-100999]",
+                                         "chats.-100999.include_memory=false",
+                                         "chats.-100999.record=false",
+                                         "chats.-100999.proactive.enabled=true",
+                                         "chats.-100999.proactive.interval_seconds=1800",
+                                         "chats.-100999.proactive.quiet_hours=[22,8]")
+        self.assertEqual(code, 0, err)
+        saved = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertFalse(saved["chats"]["-100999"]["include_memory"])
+        self.assertEqual(saved["chats"]["-100999"]["proactive"]["interval_seconds"], 1800)
+        _code, out, _err = self.run_setup("show")
+        self.assertIn("-100999: never quotes memory, does not record, speaks first", out)
+        self.assertIn("every 30 min, quiet 22:00–08:00", out)
+        self.assertIn("memory/groups/-100999", out)
+
+    def test_a_group_field_typo_is_refused(self):
+        code, _out, err = self.run_setup("set", "chats.-100999.quote=false")
+        self.assertEqual(code, 3)
+        self.assertIn("unknown key", err)
+        self.assertIn("include_memory", err)
+        self.assertFalse(self.config.exists())
+
+    def test_a_group_wrong_shape_is_a_bad_value(self):
+        code, _out, err = self.run_setup("set", "chats.-100999.proactive.quiet_hours=8")
+        self.assertEqual(code, 3)
+        self.assertIn("two hours", err)
+        self.assertFalse(self.config.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

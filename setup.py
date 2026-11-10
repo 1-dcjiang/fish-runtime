@@ -16,6 +16,7 @@ Exit codes: 0 ok · 2 configuration is invalid · 3 bad key or value (nothing wr
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -86,7 +87,17 @@ def parse_value(text: str):
 def check_path(path: str) -> None:
     if path in SCALARS:
         return
-    root = path.split(".")[0]
+    parts = path.split(".")
+    if parts[0] == "chats":
+        if len(parts) < 3:
+            raise ConfigError(3, "chats paths look like chats.-100999.include_memory "
+                                "(a chat id, then the field)")
+        leaf = ".".join(parts[2:])
+        if leaf not in bot.CHAT_FIELDS:
+            raise ConfigError(3, f"unknown key: {path} "
+                                f"(known in chats: {', '.join(sorted(bot.CHAT_FIELDS))})")
+        return
+    root = parts[0]
     if root not in SECTIONS:
         raise ConfigError(3, f"unknown key: {path} (try `python setup.py show` for the real ones)")
     if "." not in path:
@@ -110,23 +121,24 @@ def apply_assignment(cfg: dict, assignment: str) -> tuple[str, object, object]:
     problem = bot.check_type(key, value)
     if problem:
         raise ConfigError(3, problem)
-    if "." in key:
-        root, leaf = key.split(".", 1)
-        section = cfg.get(root)
-        if not isinstance(section, dict):
-            section = {}
-        section = {**section, leaf: value}
-        cfg[root] = section
-    else:
-        cfg[key] = value
+    node = cfg
+    for part in key.split(".")[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+        node[part] = child
+        node = child
+    node[key.split(".")[-1]] = value
     return key, before, value
 
 
 def current(cfg: dict, path: str):
-    if "." not in path:
-        return cfg.get(path)
-    root, leaf = path.split(".", 1)
-    return (cfg.get(root) or {}).get(leaf)
+    node = cfg
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
 
 
 def structural_problems(cfg: dict) -> list[str]:
@@ -174,6 +186,31 @@ def describe(cfg: dict) -> str:
     reply = cfg.get("reply") or {}
     lines.append(f"replies: {'quote recalled memory' if reply.get('include_memory', True) else 'never quote memory'}"
                  " (groups included unless turned off)")
+    chats = cfg.get("chats") or {}
+    if chats:
+        lines.append("per conversation:")
+        for key, entry in chats.items():
+            entry = entry if isinstance(entry, dict) else {}
+            bits = ["quotes memory" if entry.get("include_memory", reply.get("include_memory", True))
+                    else "never quotes memory"]
+            bits.append("records" if entry.get("record", cfg.get("record_episodes") != "off")
+                        else "does not record")
+            bits.append("speaks first" if (entry.get("proactive") or {}).get("enabled")
+                        else "stays silent until spoken to")
+            prog = entry.get("proactive") or {}
+            if prog.get("enabled"):
+                beat = dict(cfg.get("beat") or {})
+                for name in ("quiet_hours", "max_messages_per_day", "nudge_after_hours", "min_gap_minutes"):
+                    if name in prog:
+                        beat[name] = prog[name]
+                minutes = int(prog.get("interval_seconds") or beat.get("interval_seconds") or 900) // 60
+                quiet = beat.get("quiet_hours") or []
+                quiet_text = f", quiet {quiet[0]:02d}:00–{quiet[1]:02d}:00" if isinstance(quiet, (list, tuple)) and len(quiet) == 2 else ""
+                cap = beat.get("max_messages_per_day")
+                bits.append(f"every {minutes} min{quiet_text}"
+                            + (f", at most {cap}/day" if cap else ""))
+            where = "memory/" if key == "private" else f"memory/groups/{bot.filesafe(str(key))}/"
+            lines.append(f"  {key}: {', '.join(bits)} (own store in {where})")
     limits = cfg["limits"]
     lines.append(f"limits: {limits.get('max_messages_per_minute')} replies/min per chat, "
                  f"incoming text cut at {limits.get('max_message_chars')} chars")
@@ -190,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
 
     path = Path(args.config)
     try:
-        cfg = load(path)
+        cfg = copy.deepcopy(load(path))
         if args.command == "set":
             if not args.assignments:
                 raise ConfigError(3, "set needs at least one key=value")

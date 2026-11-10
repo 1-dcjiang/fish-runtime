@@ -18,7 +18,7 @@
   },
   "telegram": {
     "token_env": "FISH_TG_TOKEN",
-    "allow_chat_ids": [123456789],
+    "allow_chat_ids": [123456789, -100999],
     "allow_user_ids": []
   },
   "discord": {
@@ -33,8 +33,24 @@
   "proactive": {
     "enabled": false,
     "platform": "telegram",
-    "target": 123456789,
+    "target": "",
     "interval_seconds": 900,
     "include_memory": false
+  },
+  "chats": {
+    "private": {
+      "include_memory": true,
+      "record": true
+    },
+    "-100999": {
+      "include_memory": false,
+      "record": false,
+      "proactive": {
+        "enabled": false,
+        "interval_seconds": 1800,
+        "quiet_hours": [22, 8],
+        "max_messages_per_day": 2
+      }
+    }
   }
 }

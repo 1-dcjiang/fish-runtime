@@ -18,8 +18,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -56,6 +59,8 @@ BOT_DEFAULTS = {
     "run_cycle_on_tick": True,
     # replies quote recalled memory by default — in a group too; set false to keep the store out of replies
     "reply": {"include_memory": True},
+    # per-conversation overrides: "private" or a chat id, each with its own memory store and state file
+    "chats": {},
     "model": {"mode": "offline"},
     "channel": {"type": "stdout"},
     "beat": {"interval_seconds": 900, "quiet_hours": [23, 7], "min_gap_minutes": 20,
@@ -143,6 +148,21 @@ TYPE_RULES = {
     "discord.token_env": ("str", None, None),
     "model.mode": ("str", None, None),
     "model.timeout": ("int", 1, None),
+    # per-conversation settings; the chat id segment is free-form, the tail is fixed
+    "chats.*.include_memory": ("bool", None, None),
+    "chats.*.record": ("bool", None, None),
+    "chats.*.memory_root": ("str", None, None),
+    "chats.*.state_file": ("str", None, None),
+    "chats.*.persona": ("str", None, None),
+    "chats.*.proactive.enabled": ("bool", None, None),
+    "chats.*.proactive.platform": ("str", None, None),
+    "chats.*.proactive.target": ("id", None, None),
+    "chats.*.proactive.interval_seconds": ("int", 0, None),
+    "chats.*.proactive.include_memory": ("bool", None, None),
+    "chats.*.proactive.quiet_hours": ("hours", None, None),
+    "chats.*.proactive.max_messages_per_day": ("int", 0, None),
+    "chats.*.proactive.nudge_after_hours": ("num", 0, None),
+    "chats.*.proactive.min_gap_minutes": ("int", 0, None),
 }
 
 TYPE_HINTS = {
@@ -166,7 +186,7 @@ def value_of(cfg: dict, path: str):
 
 def check_type(path: str, value) -> str | None:
     """`None` when the value has the shape the runtime needs, otherwise a sentence saying what it wanted."""
-    rule = TYPE_RULES.get(path)
+    rule = TYPE_RULES.get(_rule_key(path))
     if not rule:
         return None
     kind, low, high = rule
@@ -208,6 +228,192 @@ def check_type(path: str, value) -> str | None:
     return None
 
 
+def _rule_key(path: str) -> str:
+    """`chats.-100999.include_memory` → `chats.*.include_memory`."""
+    parts = path.split(".")
+    if parts[0] == "chats" and len(parts) >= 3:
+        return ".".join([parts[0], "*"] + parts[2:])
+    return path
+
+
+# Which fields a single conversation entry may carry, and which type each one needs.
+CHAT_FIELDS = (
+    "include_memory", "record", "memory_root", "state_file", "persona",
+    "proactive.enabled", "proactive.platform", "proactive.target",
+    "proactive.interval_seconds", "proactive.include_memory", "proactive.quiet_hours",
+    "proactive.max_messages_per_day", "proactive.nudge_after_hours", "proactive.min_gap_minutes",
+)
+
+
+def _entries(entry: dict, prefix: str = "") -> dict:
+    """Flatten one chat entry into dotted leaves, so the same type table can police it."""
+    flat = {}
+    for key, value in entry.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_entries(value, path + "."))
+        else:
+            flat[path] = value
+    return flat
+
+
+def chat_problems(cfg: dict) -> list[str]:
+    problems: list[str] = []
+    chats = cfg.get("chats")
+    if chats is None:
+        return problems
+    if not isinstance(chats, dict):
+        return ["chats must be an object of chat-id → settings"]
+    for key, entry in chats.items():
+        if not isinstance(entry, dict):
+            problems.append(f"chats.{key} must be an object of settings")
+            continue
+        for leaf, value in _entries(entry).items():
+            if leaf not in CHAT_FIELDS:
+                problems.append(f"chats.{key}: unknown field {leaf} "
+                                f"(known: {', '.join(sorted(CHAT_FIELDS))})")
+                continue
+            problem = check_type(f"chats.x.{leaf}", value)
+            if problem:
+                problems.append(problem.replace("chats.x.", f"chats.{key}."))
+    return problems
+
+
+def chat_key(chat_id, private: bool) -> str:
+    """`private` is one conversation; every group is its own, keyed by the chat id."""
+    return "private" if private else str(chat_id)
+
+
+def filesafe(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(key)) or "chat"
+
+
+def chat_entry(cfg: dict, key: str) -> dict:
+    entry = ((cfg.get("chats") or {}).get(key) or {})
+    return entry if isinstance(entry, dict) else {}
+
+
+def context_paths(cfg: dict, key: str) -> tuple[str, str]:
+    entry = chat_entry(cfg, key)
+    base_memory = Path(cfg["memory_root"])
+    base_state = Path(cfg["state_file"])
+    memory_root = entry.get("memory_root") or (
+        str(base_memory) if key == "private" else str(base_memory / "groups" / filesafe(key)))
+    state_file = entry.get("state_file") or (
+        str(base_state) if key == "private"
+        else str(base_state.with_name(f"{base_state.stem}.{filesafe(key)}{base_state.suffix}")))
+    return memory_root, state_file
+
+
+def context_cfg(cfg: dict, key: str) -> dict:
+    """The config one conversation actually runs with: its own memory store, state file, and switches.
+
+    Private chats share the base store. Every group gets its own under `memory/groups/<id>`, so a
+    member's small talk cannot fade, fold or overwrite what the character remembers about you.
+    """
+    entry = chat_entry(cfg, key)
+    memory_root, state_file = context_paths(cfg, key)
+    ccfg = copy.deepcopy(cfg)
+    ccfg["memory_root"] = memory_root
+    ccfg["state_file"] = state_file
+    if entry.get("persona"):
+        ccfg["persona"] = entry["persona"]
+    quoting = (cfg.get("reply") or {}).get("include_memory", True)
+    ccfg["reply"] = {"include_memory": bool(entry.get("include_memory", quoting))}
+    recording = cfg.get("record_episodes") != "off"
+    ccfg["record_episodes"] = "auto" if bool(entry.get("record", recording)) else "off"
+
+    overlay = dict(entry.get("proactive") or {})
+    if key == "private":
+        ccfg["proactive"] = {**(cfg.get("proactive") or {}), **overlay}
+    else:
+        # a group speaks first only when its own entry says so; the default is silence
+        ccfg["proactive"] = {"enabled": False, "platform": "", "target": key,
+                             "interval_seconds": 0, "include_memory": False}
+        ccfg["proactive"].update(overlay)
+        ccfg["proactive"]["target"] = overlay.get("target") or key
+        ccfg["proactive"].setdefault("platform", "")
+    for name in ("quiet_hours", "max_messages_per_day", "nudge_after_hours", "min_gap_minutes"):
+        if name in overlay:
+            ccfg["beat"] = {**ccfg["beat"], name: overlay[name]}
+    if key != "private" and not ccfg["proactive"].get("platform"):
+        ccfg["proactive"]["platform"] = platform_for_chat(cfg, key)
+    return ccfg
+
+
+def platform_for_chat(cfg: dict, key: str) -> str:
+    """Which platform a chat id belongs to, judged by the allowlists it appears in."""
+    for platform, field in (("telegram", "allow_chat_ids"), ("discord", "allow_channel_ids")):
+        section = cfg.get(platform)
+        if not isinstance(section, dict):
+            continue
+        if str(key) in [str(v) for v in (section.get(field) or [])]:
+            return platform
+    return ((cfg.get("proactive") or {}).get("platform") or "telegram")
+
+
+class Contexts:
+    """One Router, memory store and state file per conversation, sharing a single write lock."""
+
+    def __init__(self, cfg: dict, lock=None, now_fn=None, compose=None):
+        self.cfg = cfg
+        self.lock = lock or threading.Lock()
+        self.now_fn = now_fn
+        self.compose = compose
+        self._map: dict[str, tuple[dict, dict, "Router"]] = {}
+
+    def get(self, key: str):
+        if key not in self._map:
+            ccfg = context_cfg(self.cfg, key)
+            # a group's store does not exist yet the first time someone speaks in it; create the skeleton
+            # before the first turn, because recall/cycle refuse to run against a missing directory
+            (Path(ccfg["memory_root"]) / "entries").mkdir(parents=True, exist_ok=True)
+            state = fish.load_state(Path(ccfg["state_file"]))
+            self._map[key] = (ccfg, state,
+                              Router(ccfg, state, now_fn=self.now_fn, compose=self.compose,
+                                     lock=self.lock))
+        return self._map[key]
+
+    @property
+    def state(self) -> dict:
+        """The private conversation's state, which also carries the polling offset."""
+        return self.get("private")[1]
+
+    def items(self):
+        return list(self._map.items())
+
+    def handle(self, platform: str, chat_id, user_id, text: str, private: bool = True) -> str | None:
+        key = chat_key(chat_id, private)
+        _ccfg, _state, router = self.get(key)
+        return router.handle(platform, chat_id, user_id, text, private=private)
+
+
+def resolve_chat_paths(cfg: dict, base: Path) -> None:
+    """Make paths inside `chats` relative to the config file, like every other path in the config."""
+    for entry in (cfg.get("chats") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        for field in ("memory_root", "state_file", "persona"):
+            value = entry.get(field)
+            if isinstance(value, str) and value and not Path(value).is_absolute():
+                entry[field] = str((base / value).resolve())
+
+
+def proactive_plan(cfg: dict) -> list[tuple[str, dict]]:
+    """Every conversation that should beat, with its own config (interval, target, quiet hours)."""
+    plan: list[tuple[str, dict]] = []
+    private = context_cfg(cfg, "private")
+    if (private.get("proactive") or {}).get("enabled"):
+        plan.append(("private", private))
+    for key in list(cfg.get("chats") or {}):
+        if key == "private":
+            continue
+        ccfg = context_cfg(cfg, key)
+        if (ccfg.get("proactive") or {}).get("enabled"):
+            plan.append((key, ccfg))
+    return plan
+
+
 def type_problems(cfg: dict) -> list[str]:
     problems = []
     # with proactive off its fields are placeholders ("", 0) — validate() only checks them once enabled
@@ -234,6 +440,7 @@ def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
     problems: list[str] = []
     # shape first: `beat.quiet_hours: 8` would otherwise pass this gate and throw on every beat
     problems.extend(type_problems(cfg))
+    problems.extend(chat_problems(cfg))
     platforms = platforms_of(cfg)
     for platform in platforms:
         section = cfg.get(platform)
@@ -281,6 +488,30 @@ def validate(cfg: dict, require_tokens: bool = True) -> list[str]:
         else:
             if interval < 0 or 0 < interval < 30:
                 problems.append("proactive: interval_seconds must be 0 (inherit) or at least 30")
+    for key, ccfg in proactive_plan(cfg):
+        if key == "private":
+            continue  # covered by the global check above
+        group = ccfg.get("proactive") or {}
+        platform = group.get("platform") or ""
+        target = str(group.get("target") or key)
+        if platform not in {"telegram", "discord"}:
+            problems.append(f"chats.{key}: proactive platform must be telegram or discord")
+        elif platform not in platforms:
+            problems.append(f"chats.{key}: proactive platform {platform} is not in the platform list")
+        else:
+            allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
+            listed = (cfg.get(platform) or {}).get(allow_keys[0]) or []
+            allow = [str(v) for v in listed] if isinstance(listed, (list, tuple)) else []
+            if target not in allow:
+                problems.append(f"chats.{key}: proactive target {target} is not in the {platform} allowlist")
+        raw = group.get("interval_seconds") or 0
+        try:
+            raw = int(raw)
+        except (TypeError, ValueError):
+            problems.append(f"chats.{key}: proactive interval_seconds is not an integer")
+        else:
+            if raw < 0 or 0 < raw < 30:
+                problems.append(f"chats.{key}: proactive interval_seconds must be 0 (inherit) or at least 30")
     return problems
 
 
@@ -674,6 +905,7 @@ def main(argv: list[str] | None = None) -> int:
     config_path = Path(args.config)
     cfg = load_config(config_path)
     cfg = fish.resolve_paths(cfg, config_path.resolve().parent)
+    resolve_chat_paths(cfg, config_path.resolve().parent)
     platforms = cfg.get("platform") or []
     if isinstance(platforms, str):
         platforms = [platforms]
@@ -694,29 +926,35 @@ def main(argv: list[str] | None = None) -> int:
     state = fish.load_state(Path(cfg["state_file"]))
     stop = threading.Event()
     lock = threading.Lock()  # a turn and a beat both rewrite state; one at a time
-    router = Router(cfg, state, lock=lock)
+    contexts = Contexts(cfg, lock=lock)
 
     try:
         if args.once:
             if "telegram" in platforms:
-                TelegramBot(cfg, router).poll_once()
+                TelegramBot(cfg, contexts).poll_once()
             if "discord" in platforms:
                 print("note: --once only runs one Telegram poll; Discord needs the gateway loop, "
                       "so nothing was pulled for it", file=sys.stderr)
             return 0
         threads: list[threading.Thread] = []
         if "telegram" in platforms:
-            threads.append(threading.Thread(target=TelegramBot(cfg, router).run, daemon=True))
+            threads.append(threading.Thread(target=TelegramBot(cfg, contexts).run, daemon=True))
         if "discord" in platforms:
-            threads.append(threading.Thread(target=DiscordBot(cfg, router).run, daemon=True))
-        if (cfg.get("proactive") or {}).get("enabled"):
-            sender = proactive_sender(cfg)
-            if sender:
-                threads.append(threading.Thread(
-                    target=BeatLoop(cfg, state, sender, lock=lock, stop=stop).run, daemon=True))
-            else:
-                print("warning: proactive is enabled but no sender could be built; beat not started",
-                      file=sys.stderr)
+            threads.append(threading.Thread(target=DiscordBot(cfg, contexts).run, daemon=True))
+        for key, ccfg in proactive_plan(cfg):
+            sender = proactive_sender(ccfg)
+            if not sender:
+                print(f"warning: proactive for {key} is enabled but no sender could be built; "
+                      "beat not started", file=sys.stderr)
+                continue
+            state_for = contexts.get(key)[1]
+            interval = int((ccfg.get("proactive") or {}).get("interval_seconds") or 0) or None
+            threads.append(threading.Thread(
+                target=BeatLoop(ccfg, state_for, sender, lock=lock, stop=stop,
+                                interval=interval).run, daemon=True))
+            print(f"[beat] {key} every {max(30, interval or int(ccfg['beat'].get('interval_seconds', 900)))}s "
+                  f"to {ccfg['proactive'].get('platform')} {ccfg['proactive'].get('target')}",
+                  file=sys.stderr)
         for thread in threads:
             thread.start()
         print("[bot] running; Ctrl-C stops", file=sys.stderr)
@@ -724,7 +962,8 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         stop.set()
-        fish.save_state(Path(cfg["state_file"]), state)
+        for ccfg, cstate, _router in contexts.items():
+            fish.save_state(Path(ccfg["state_file"]), cstate)
         print("[bot] stopped", file=sys.stderr)
     return 0
 

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,79 @@ class BotFixture(unittest.TestCase):
     def build_index(self):
         import memory_cycle as mc
         self.assertEqual(mc.main(["index", "--root", str(self.memory), "--today", "2026-11-10"]), 0)
+
+
+class ContextTests(BotFixture):
+    """私聊与每个群是各自独立的记忆库和状态文件，不是同一份东西的三种叫法。"""
+
+    def test_private_and_each_group_get_their_own_store(self):
+        private = bot.context_cfg(self.cfg, "private")
+        group = bot.context_cfg(self.cfg, "-100999")
+        self.assertEqual(private["memory_root"], self.cfg["memory_root"])
+        self.assertTrue(group["memory_root"].replace("\\", "/").endswith("memory/groups/-100999"))
+        self.assertNotEqual(private["state_file"], group["state_file"])
+        self.assertIn("-100999", Path(group["state_file"]).name)
+
+    def test_switches_are_per_chat(self):
+        self.cfg["chats"] = {"-100999": {"include_memory": False, "record": False}}
+        group = bot.context_cfg(self.cfg, "-100999")
+        private = bot.context_cfg(self.cfg, "private")
+        self.assertFalse(group["reply"]["include_memory"])
+        self.assertEqual(group["record_episodes"], "off")
+        self.assertTrue(private["reply"]["include_memory"])
+        self.assertNotEqual(private["record_episodes"], "off")
+
+    def test_routing_uses_the_context_store_and_switches(self):
+        seen = {}
+
+        def compose(cfg, state, now, text, record=True, include_memory=True):
+            seen.setdefault(text, (cfg["memory_root"], include_memory, record))
+            return {"reply": "ok", "hits": [], "episode": None}
+
+        self.cfg["chats"] = {"-100999": {"include_memory": False, "record": False}}
+        self.cfg["telegram"]["allow_chat_ids"] = ["111", "-100999"]
+        contexts = bot.Contexts(self.cfg, now_fn=lambda: datetime.fromisoformat(self.now), compose=compose)
+        contexts.handle("telegram", "111", "5", "dm", private=True)
+        contexts.handle("telegram", "-100999", "5", "group", private=False)
+        dm_root, dm_quote, dm_record = seen["dm"]
+        group_root, group_quote, group_record = seen["group"]
+        self.assertEqual(dm_root, self.cfg["memory_root"])
+        self.assertTrue(group_root.endswith("groups\\-100999") or group_root.endswith("groups/-100999"))
+        self.assertTrue(dm_quote)
+        self.assertFalse(group_quote)
+        self.assertTrue(dm_record)
+        self.assertFalse(group_record)
+
+    def test_an_unknown_chat_field_is_reported(self):
+        self.cfg["chats"] = {"-100999": {"quote_memory": False}}
+        joined = " | ".join(bot.validate(self.cfg))
+        self.assertIn("unknown field quote_memory", joined)
+
+    def test_a_group_beat_needs_its_chat_allowlisted(self):
+        self.cfg["chats"] = {"-100999": {"proactive": {"enabled": True}}}
+        joined = " | ".join(bot.validate(self.cfg))
+        self.assertIn("chats.-100999: proactive target -100999 is not in the telegram allowlist", joined)
+
+    def test_each_beat_uses_its_own_interval_and_target(self):
+        self.cfg["telegram"]["allow_chat_ids"] = ["111", "-100999", "-777"]
+        self.cfg["chats"] = {
+            "-100999": {"proactive": {"enabled": True, "interval_seconds": 1200}},
+            "-777": {"proactive": {"enabled": True, "interval_seconds": 3600,
+                                   "quiet_hours": [22, 8]}},
+        }
+        plan = dict(bot.proactive_plan(self.cfg))
+        self.assertEqual(set(plan), {"-100999", "-777"})
+        self.assertEqual(plan["-100999"]["proactive"]["target"], "-100999")
+        self.assertEqual(plan["-100999"]["proactive"]["platform"], "telegram")
+        self.assertEqual(plan["-777"]["beat"]["quiet_hours"], [22, 8])
+
+    def test_a_group_turn_does_not_touch_private_memory(self):
+        self.cfg["telegram"]["allow_chat_ids"] = ["111", "-100999"]
+        contexts = bot.Contexts(self.cfg, now_fn=lambda: datetime.fromisoformat(self.now))
+        contexts.handle("telegram", "-100999", "5", "group chatter about a project", private=False)
+        group_entries = list((Path(self.cfg["memory_root"]) / "groups" / "-100999" / "entries").glob("*.md"))
+        self.assertEqual(len(group_entries), 1)
+        self.assertEqual(list((self.memory / "entries").glob("*.md")), [])
 
 
 class ValidateTests(BotFixture):
