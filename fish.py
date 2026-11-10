@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""fish-runtime: an always-on character with a weighted memory that fades.
+
+The brain of a "大肥鱼"-style resident bot, for hosts that have no plugin runtime:
+it owns the clock (a heartbeat decides when to speak), the mood, and the memory
+arithmetic — and delegates decay to the persona-and-memory skill's cycle script.
+
+Commands:
+  status                    print state, memory size, next-speak estimate
+  tick                      one heartbeat: maybe speak, then run the memory cycle
+  run                       loop tick until interrupted (--once runs a single tick)
+  say --text "..."          the user said something: recall, reply, maybe record
+  verify --ids m-...        the user confirmed a memory: verified+1, mood up
+
+Every command takes --now for deterministic runs, so this is testable without a clock.
+Relative paths in the config resolve against the config file's directory.
+Stdlib only. No network unless a channel or model is configured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adapters  # noqa: E402
+
+INDEX_LINE = re.compile(
+    r"- (?P<id>[A-Za-z0-9-]+) \[(?P<status>[a-z]+) w=(?P<weight>[\d.]+)\] "
+    r"(?P<kind>[a-z]+) \| (?P<text>.*)"
+)
+
+DEFAULTS = {
+    "persona": "memory/persona.json",
+    "memory_root": "memory",
+    "state_file": "state.json",
+    "cycle_script": None,
+    "run_cycle_on_tick": True,
+    "record_episodes": "auto",
+    "model": {"mode": "offline"},
+    "channel": {"type": "stdout"},
+    "beat": {
+        "quiet_hours": [23, 7],
+        "min_gap_minutes": 20,
+        "nudge_after_hours": 6,
+        "nudge_cooldown_hours": 12,
+        "max_messages_per_day": 3,
+        "min_weight": 0.5,
+    },
+}
+
+MOOD_DECAY_PER_DAY = 0.6
+MOOD_USER_BOOST = 0.15
+MOOD_FOLD_DROP = 0.2
+MOOD_PROMOTE_RISE = 0.3
+MOOD_VERIFY_RISE = 0.2
+
+# "in" / "hi" / "在吗" is not a memory. Recording it costs a file and pushes real memories down.
+EPHEMERAL = re.compile(
+    r"^(hi|hey|hello|yo|ok|thanks|thx|good night|good morning|bye|"
+    r"在吗|在么|你好|您好|哈喽|嗨|早|早安|晚安|拜拜|收到|好的|谢谢|嗯+|啊+|哦+)$",
+    re.IGNORECASE,
+)
+DURABLE_MIN_CHARS = 12
+
+
+def merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        print(f"error: config not found: {path}", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        return merge(DEFAULTS, json.loads(path.read_text(encoding="utf-8")))
+    except json.JSONDecodeError as exc:
+        print(f"error: config is not valid JSON: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def resolve_paths(cfg: dict, base: Path) -> dict:
+    """Config-relative paths, so the runtime can be launched from anywhere."""
+    for key in ("persona", "memory_root", "state_file", "cycle_script"):
+        value = cfg.get(key)
+        if value and not Path(value).is_absolute():
+            cfg[key] = str((base / value).resolve())
+    return cfg
+
+
+def load_state(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            print("warning: state file unreadable, starting fresh", file=sys.stderr)
+    return {"mood": 0.0, "mood_at": None, "last_user_at": None,
+            "last_nudge_at": None, "sent_today": 0, "sent_day": None}
+
+
+def save_state(path: Path, state: dict) -> None:
+    """Write through a temp file: a crash mid-write must not leave unparseable state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def mood_now(state: dict, now: datetime) -> float:
+    raw = float(state.get("mood", 0.0))
+    stamp = state.get("mood_at")
+    if not stamp:
+        return raw
+    try:
+        since = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        print(f"warning: mood_at {stamp!r} is not a timestamp, mood used as stored",
+              file=sys.stderr)
+        return raw
+    days = max(0.0, (now - since).total_seconds() / 86400.0)
+    value = max(-1.0, min(1.0, raw * (MOOD_DECAY_PER_DAY ** days)))
+    return 0.0 if abs(value) < 0.02 else value
+
+
+def roll_day(state: dict, today: str) -> None:
+    """Reset the daily counter when the date changed — outside decide(), so that stays pure."""
+    if state.get("sent_day") != today:
+        state["sent_day"] = today
+        state["sent_today"] = 0
+
+
+def ensure_index(cfg: dict, memory_root: Path, today: str) -> None:
+    """A fresh store has no index yet; build it before the first read."""
+    if (memory_root / "INDEX.md").exists():
+        return
+    script = cfg.get("cycle_script")
+    if not script or not Path(script).exists():
+        return
+    try:
+        subprocess.run([sys.executable, str(script), "index", "--root", str(memory_root),
+                        "--today", today], capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        print(f"warning: could not build the index: {exc}", file=sys.stderr)
+
+
+def read_index(memory_root: Path) -> list[dict]:
+    path = memory_root / "INDEX.md"
+    if not path.exists():
+        return []
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = INDEX_LINE.match(line.strip())
+        if match:
+            entries.append({
+                "id": match.group("id"),
+                "status": match.group("status"),
+                "weight": float(match.group("weight")),
+                "kind": match.group("kind"),
+                "text": match.group("text").strip(),
+            })
+    return entries
+
+
+def tokens(text: str) -> set[str]:
+    """Rough tokenisation that also works for CJK: words plus character bigrams."""
+    clean = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (text or "").lower())
+    words = {w for w in clean.split() if len(w) > 1}
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", clean):
+        words.update(run[i:i + 2] for i in range(len(run) - 1))
+    return words
+
+
+def recall(entries: list[dict], text: str, limit: int = 3) -> list[dict]:
+    """Relevant memories only. No text at all falls back to the heaviest — a topic never does."""
+    if not text:
+        return sorted(entries, key=lambda e: -e["weight"])[:limit]
+    query = tokens(text)
+    if not query:
+        return []
+    scored = []
+    for entry in entries:
+        overlap = len(query & tokens(entry["text"]))
+        if overlap:
+            scored.append((overlap * 2 + entry["weight"], entry))
+    scored.sort(key=lambda pair: -pair[0])
+    return [entry for _score, entry in scored][:limit]
+
+
+def peak_memory(entries: list[dict], min_weight: float) -> dict | None:
+    candidates = [e for e in entries
+                  if e["status"] not in {"archived", "superseded"} and e["weight"] >= min_weight]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda e: e["weight"])
+
+
+def in_quiet_hours(now: datetime, quiet: list[int] | None) -> bool:
+    if not quiet or len(quiet) != 2:
+        return False
+    start, end = quiet
+    if start == end:
+        return False
+    hour = now.hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def decide(cfg: dict, state: dict, entries: list[dict], now: datetime) -> tuple[bool, str]:
+    """Read-only decision: may the character speak now, and why not if not."""
+    beat = cfg["beat"]
+    if in_quiet_hours(now, beat.get("quiet_hours")):
+        return False, "quiet_hours"
+    sent_day = state.get("sent_day")
+    sent_today = 0 if sent_day != now.date().isoformat() else int(state.get("sent_today", 0))
+    if sent_today >= int(beat.get("max_messages_per_day", 3)):
+        return False, "daily_cap"
+    last_user = state.get("last_user_at")
+    if last_user:
+        gap = (now - datetime.fromisoformat(last_user)).total_seconds() / 60.0
+        if gap < float(beat.get("min_gap_minutes", 20)):
+            return False, f"recent_user_message ({int(gap)}m ago)"
+    last_nudge = state.get("last_nudge_at")
+    if last_nudge:
+        cool = (now - datetime.fromisoformat(last_nudge)).total_seconds() / 3600.0
+        if cool < float(beat.get("nudge_cooldown_hours", 12)):
+            return False, f"cooldown ({cool:.1f}h left of {beat.get('nudge_cooldown_hours')}h)"
+    if state.get("last_user_at"):
+        idle_from = state["last_user_at"]
+    elif state.get("started_at"):
+        idle_from = state["started_at"]
+    else:
+        idle_from = now.isoformat()
+    idle_hours = (now - datetime.fromisoformat(idle_from)).total_seconds() / 3600.0
+    if idle_hours < float(beat.get("nudge_after_hours", 6)):
+        return False, f"not_idle_enough ({idle_hours:.1f}h)"
+    if not peak_memory(entries, float(beat.get("min_weight", 0.5))):
+        return False, "nothing_worth_saying"
+    return True, f"idle {idle_hours:.1f}h"
+
+
+def run_cycle(cfg: dict, memory_root: Path, today: str) -> dict | None:
+    script = cfg.get("cycle_script")
+    if not script:
+        return None
+    path = Path(script)
+    if not path.exists():
+        print(f"warning: cycle script not found: {path}", file=sys.stderr)
+        return None
+    command = [sys.executable, str(path), "cycle", "--root", str(memory_root),
+               "--today", today, "--json"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        print(f"warning: memory cycle failed: {exc}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(f"warning: memory cycle exited {result.returncode}: {result.stderr.strip()}",
+              file=sys.stderr)
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def apply_cycle_mood(state: dict, cycle: dict | None, now: datetime) -> None:
+    if not cycle:
+        return
+    mood = mood_now(state, now)
+    for _id in cycle.get("folded", []):
+        mood -= MOOD_FOLD_DROP
+    for _id in cycle.get("promoted", []):
+        mood += MOOD_PROMOTE_RISE
+    state["mood"] = max(-1.0, min(1.0, mood))
+    state["mood_at"] = now.isoformat()
+
+
+def new_episode_id(memory_root: Path, now: datetime) -> str:
+    day = now.strftime("%Y%m%d")
+    prefix = f"m-{day}-"
+    used = 0
+    entries_dir = memory_root / "entries"
+    if entries_dir.is_dir():
+        for path in entries_dir.glob(f"{prefix}*.md"):
+            try:
+                used = max(used, int(path.stem.rsplit("-", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return f"{prefix}{used + 1:02d}"
+
+
+def should_record(cfg: dict, text: str) -> bool:
+    policy = str(cfg.get("record_episodes", "auto")).lower()
+    if policy == "off":
+        return False
+    if policy == "always":
+        return True
+    body = " ".join((text or "").split())
+    if len(body) < DURABLE_MIN_CHARS:
+        return False
+    return not EPHEMERAL.match(body)
+
+
+def write_episode(memory_root: Path, text: str, now: datetime) -> Path:
+    entries_dir = memory_root / "entries"
+    entries_dir.mkdir(parents=True, exist_ok=True)
+    entry_id = new_episode_id(memory_root, now)
+    body = " ".join(text.split())[:400]
+    path = entries_dir / f"{entry_id}.md"
+    path.write_text(
+        "---\n"
+        f"id: {entry_id}\n"
+        "kind: episode\n"
+        "weight: 0.45\n"
+        "hits: 0\n"
+        "verified: 0\n"
+        "status: active\n"
+        "decay: 0.92\n"
+        f"created: {now.date().isoformat()}\n"
+        f"last_seen: {now.date().isoformat()}\n"
+        "---\n\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def load_persona(cfg: dict) -> dict:
+    fallback = {"name": "fish", "self": "我", "user": "你", "language": "Chinese",
+                "register": "casual", "emoji_policy": "none", "flourish": [],
+                "refusal_style": "直接说不"}
+    path = Path(cfg["persona"])
+    if not path.exists():
+        return fallback
+    try:
+        card = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"warning: persona card unreadable ({exc}); using the default voice",
+              file=sys.stderr)
+        return fallback
+    if not isinstance(card, dict):
+        print("warning: persona card is not an object; using the default voice", file=sys.stderr)
+        return fallback
+    return card
+
+
+def cmd_status(cfg: dict, state: dict, now: datetime) -> int:
+    memory_root = Path(cfg["memory_root"])
+    ensure_index(cfg, memory_root, now.date().isoformat())
+    entries = read_index(memory_root)
+    peak = peak_memory(entries, float(cfg["beat"].get("min_weight", 0.5)))
+    may, reason = decide(cfg, state, entries, now)
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+    payload = {
+        "now": now.isoformat(timespec="minutes"),
+        "mood": round(mood_now(state, now), 2),
+        "entries": len(entries),
+        "counts": counts,
+        "identity": counts.get("identity", 0),
+        "peak": peak["id"] if peak else None,
+        "may_speak": may,
+        "reason": reason,
+        "sent_today": state.get("sent_today", 0) if state.get("sent_day") == now.date().isoformat() else 0,
+        "channel": cfg["channel"].get("type"),
+        "model": cfg["model"].get("mode"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
+    memory_root = Path(cfg["memory_root"])
+    ensure_index(cfg, memory_root, now.date().isoformat())
+    state.setdefault("started_at", now.isoformat())
+    roll_day(state, now.date().isoformat())
+    entries = read_index(memory_root)
+    may, reason = decide(cfg, state, entries, now)
+    persona = load_persona(cfg)
+
+    if may:
+        peak = peak_memory(entries, float(cfg["beat"].get("min_weight", 0.5)))
+        ref = peak["text"][:90]
+        mood = mood_now(state, now)
+        lines = [f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in entries[:5]]
+        text = adapters.ModelClient(cfg["model"], persona).compose(
+            ref=ref, mood=mood, proactive=True, memory_lines=lines
+        )
+        result = adapters.Channel(cfg["channel"]).send(text)
+        if result.get("ok"):
+            state["sent_today"] = int(state.get("sent_today", 0)) + 1
+            state["sent_day"] = now.date().isoformat()
+            state["last_nudge_at"] = now.isoformat()
+            print(f"[tick] spoke via {result.get('channel')} (reason: {reason})")
+        else:
+            print(f"[tick] send failed (not counted toward the daily cap): {result.get('error')}")
+    else:
+        print(f"[tick] silent ({reason})")
+
+    if cfg.get("run_cycle_on_tick"):
+        cycle = run_cycle(cfg, memory_root, now.date().isoformat())
+        apply_cycle_mood(state, cycle, now)
+        if cycle:
+            print(f"[tick] cycle folded={len(cycle.get('folded', []))} "
+                  f"promoted={len(cycle.get('promoted', []))} "
+                  f"archived={len(cycle.get('archived', []))}")
+            entries = read_index(memory_root)
+            print(f"[tick] index now {len(entries)} entries")
+
+    save_state(Path(cfg["state_file"]), state)
+    return 0
+
+
+def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = True) -> int:
+    memory_root = Path(cfg["memory_root"])
+    ensure_index(cfg, memory_root, now.date().isoformat())
+    roll_day(state, now.date().isoformat())
+    persona = load_persona(cfg)
+
+    run_cycle(cfg, memory_root, now.date().isoformat())
+    entries = read_index(memory_root)
+    hits = recall(entries, text)
+    mood = min(1.0, mood_now(state, now) + MOOD_USER_BOOST)
+
+    reply = adapters.ModelClient(cfg["model"], persona).compose(
+        ref=hits[0]["text"][:90] if hits else "",
+        mood=mood,
+        proactive=False,
+        memory_lines=[f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in hits],
+        user_text=text,
+    )
+    result = adapters.Channel(cfg["channel"]).send(reply)
+
+    episode = None
+    if record and should_record(cfg, text):
+        episode = write_episode(memory_root, text, now)
+    if hits and cfg.get("cycle_script"):
+        ids = [e["id"] for e in hits]
+        subprocess.run([sys.executable, str(cfg["cycle_script"]), "touch",
+                        "--root", str(memory_root), "--ids", *ids,
+                        "--today", now.date().isoformat()],
+                       capture_output=True, text=True, timeout=60)
+
+    state["last_user_at"] = now.isoformat()
+    state["mood"] = mood
+    state["mood_at"] = now.isoformat()
+    save_state(Path(cfg["state_file"]), state)
+
+    kept = episode.name if episode else "nothing (nothing durable in it)"
+    print(f"[say] recorded {kept}, recalled {', '.join(e['id'] for e in hits) or 'nothing'}")
+    return 0 if result.get("ok") else 1
+
+
+def cmd_verify(cfg: dict, state: dict, now: datetime, ids: list[str]) -> int:
+    """A confirmation: this memory is independently true. The one thing a runtime cannot infer."""
+    memory_root = Path(cfg["memory_root"])
+    script = cfg.get("cycle_script")
+    if not script or not Path(script).exists():
+        print("error: verify needs cycle_script (it owns the memory arithmetic)", file=sys.stderr)
+        return 2
+    command = [sys.executable, str(script), "verify", "--root", str(memory_root),
+               "--ids", *ids, "--today", now.date().isoformat()]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        print(f"warning: verify failed: {exc}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(f"error: verify exited {result.returncode}: {result.stderr.strip()}", file=sys.stderr)
+        return result.returncode
+    state["mood"] = min(1.0, mood_now(state, now) + MOOD_VERIFY_RISE)
+    state["mood_at"] = now.isoformat()
+    save_state(Path(cfg["state_file"]), state)
+    print(f"[verify] confirmed: {', '.join(ids)} (mood +{MOOD_VERIFY_RISE})")
+    return 0
+
+
+def cmd_run(cfg: dict, state: dict, now: datetime | None, once: bool) -> int:
+    import time
+
+    interval = int(cfg["beat"].get("interval_seconds", 900))
+    state.setdefault("started_at", (now or datetime.now()).isoformat())
+    first = True
+    while True:
+        stamp = now if first else datetime.now().replace(microsecond=0)
+        first = False
+        try:
+            cmd_tick(cfg, state, stamp)
+        except KeyboardInterrupt:
+            save_state(Path(cfg["state_file"]), state)
+            print("[run] stopped")
+            return 0
+        except Exception as exc:
+            # a resident process must survive one bad tick: log it, keep the heartbeat
+            print(f"[run] tick failed: {exc}", file=sys.stderr)
+        if once:
+            return 0
+        time.sleep(interval)
+
+
+def parse_now(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    print(f"error: cannot parse --now {value!r}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="always-on character runtime")
+    parser.add_argument("command", choices=["status", "tick", "run", "say", "verify"])
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--now", help="override the clock (ISO), for tests")
+    parser.add_argument("--once", action="store_true", help="run: single tick only")
+    parser.add_argument("--text", default="", help="say: what the user said")
+    parser.add_argument("--ids", nargs="+", default=[], help="verify: memory ids to confirm")
+    parser.add_argument("--no-record", action="store_true",
+                        help="say: reply but write no episode")
+    args = parser.parse_args(argv)
+
+    config_path = Path(args.config)
+    cfg = load_config(config_path)
+    cfg = resolve_paths(cfg, config_path.resolve().parent)
+    state = load_state(Path(cfg["state_file"]))
+    now = parse_now(args.now)
+
+    if now is None:
+        now = datetime.now().replace(microsecond=0)
+    state.setdefault("started_at", now.isoformat())
+
+    if args.command == "status":
+        return cmd_status(cfg, state, now)
+    if args.command == "tick":
+        return cmd_tick(cfg, state, now)
+    if args.command == "run":
+        return cmd_run(cfg, state, now, once=args.once)
+    if args.command == "say":
+        if not args.text.strip():
+            print("error: --text is required", file=sys.stderr)
+            return 2
+        return cmd_say(cfg, state, now, args.text, record=not args.no_record)
+    if args.command == "verify":
+        if not args.ids:
+            print("error: --ids is required", file=sys.stderr)
+            return 2
+        return cmd_verify(cfg, state, now, args.ids)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

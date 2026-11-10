@@ -1,0 +1,19 @@
+{
+  "persona": "../persona-and-memory/examples/persona.json",
+  "memory_root": "../persona-and-memory/examples/memory",
+  "state_file": "state.json",
+  "cycle_script": "../persona-and-memory/scripts/memory_cycle.py",
+  "run_cycle_on_tick": true,
+  "record_episodes": "auto",
+  "model": { "mode": "offline" },
+  "channel": { "type": "stdout" },
+  "beat": {
+    "interval_seconds": 900,
+    "quiet_hours": [23, 7],
+    "min_gap_minutes": 20,
+    "nudge_after_hours": 6,
+    "nudge_cooldown_hours": 12,
+    "max_messages_per_day": 3,
+    "min_weight": 0.5
+  }
+}
