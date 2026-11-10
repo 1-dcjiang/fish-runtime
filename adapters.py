@@ -195,7 +195,9 @@ def split_message(text: str, limit: int) -> list[str]:
             cut = window.rfind(" ")
         if cut < limit // 2:
             cut = limit
-        chunks.append(rest[:cut].rstrip())
+        piece = rest[:cut].rstrip()
+        if piece.strip():  # a window of nothing but newlines must not become an empty message
+            chunks.append(piece)
         rest = rest[cut:].lstrip()
     if rest:
         chunks.append(rest)

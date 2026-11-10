@@ -214,6 +214,15 @@ class TelegramTests(BotFixture):
             self.assertEqual(b.poll_once(), 0)
         self.assertEqual(sent, [])
 
+    def test_a_corrupt_offset_does_not_wedge_polling(self):
+        self.state["telegram_offset"] = "abc"
+        b, http, sent = self.make_bot([{"ok": True, "result": [self.update()]}])
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(b.poll_once(), 1)
+        self.assertEqual(sent[0][0], "111")
+        self.assertEqual(self.state["telegram_offset"], 78)
+        self.assertNotIn("offset", http.calls[0]["params"])
+
     def test_a_long_reply_is_split_below_the_limit(self):
         router = bot.Router(self.cfg, self.state, now_fn=lambda: fish.parse_now(self.now),
                             compose=lambda *a, **k: {"reply": "字" * 5000, "hits": [], "episode": None})
@@ -305,6 +314,12 @@ class WebSocketFrameTests(unittest.TestCase):
     def test_truncated_frame_is_rejected(self):
         with self.assertRaises(ws.WebSocketError):
             ws.parse_frame(ws.build_frame(b"hello")[:4])
+
+    def test_split_message_never_emits_a_blank_chunk(self):
+        body = "a" * 1900 + "\n" + ("\n" * 400) + "tail"
+        chunks = adapters.split_message(body, 2000)
+        self.assertTrue(all(chunk.strip() for chunk in chunks), chunks)
+        self.assertTrue(all(len(chunk) <= 2000 for chunk in chunks))
 
     def test_split_message_never_exceeds_the_limit(self):
         chunks = adapters.split_message("line one\n" * 600, 200)
@@ -416,6 +431,46 @@ class ProactiveTests(BotFixture):
         os.environ.pop("FISH_TG_TOKEN", None)
         self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111"}
         self.assertIsNone(bot.proactive_sender(self.cfg))
+
+    def test_a_beat_does_not_quote_stored_memory_by_default(self):
+        self.write_entry(weight=0.9, body="User is a first-year student in Suzhou.\n")
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-09T20:00"
+        self.state["started_at"] = "2026-11-01T00:00"
+        sent = []
+        with redirect_stdout(io.StringIO()):
+            self.make_loop(sent).beat_once()
+        self.assertTrue(sent)
+        self.assertNotIn("Suzhou", sent[0])
+        self.assertNotIn("student", sent[0])
+
+    def test_memory_quote_is_opt_in_for_a_private_chat(self):
+        self.write_entry(weight=0.9, body="User is a first-year student in Suzhou.\n")
+        self.build_index()
+        self.state["last_user_at"] = "2026-11-09T20:00"
+        self.state["started_at"] = "2026-11-01T00:00"
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111",
+                                 "include_memory": True}
+        sent = []
+        loop = bot.BeatLoop(self.cfg, self.state,
+                            lambda text: (sent.append(text), {"ok": True, "channel": "telegram"})[1],
+                            now_fn=lambda: fish.parse_now(self.now))
+        with redirect_stdout(io.StringIO()):
+            loop.beat_once()
+        self.assertIn("Suzhou", sent[0])
+
+    def test_a_user_id_is_not_an_accepted_beat_target(self):
+        self.cfg["telegram"] = {"allow_chat_ids": ["111"], "allow_user_ids": ["777"]}
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "777"}
+        self.assertIn("is not in the telegram allowlist", " | ".join(bot.validate(self.cfg)))
+
+    def test_a_spinning_interval_is_rejected_and_clamped(self):
+        self.cfg["proactive"] = {"enabled": True, "platform": "telegram", "target": "111",
+                                 "interval_seconds": 5}
+        self.assertIn("at least 30", " | ".join(bot.validate(self.cfg)))
+        loop = bot.BeatLoop(self.cfg, self.state, lambda text: {"ok": True},
+                            interval=1, now_fn=lambda: fish.parse_now(self.now))
+        self.assertEqual(loop.interval, 30)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,9 @@ BOT_DEFAULTS = {
     "discord": {"token_env": "FISH_DISCORD_TOKEN", "allow_channel_ids": [], "allow_user_ids": []},
     # Off by default: a bot that messages you first is a behaviour you opt into, and the target has to be
     # one you already allowlisted — the config you write is the only thing that decides where it speaks.
-    "proactive": {"enabled": False, "platform": "", "target": "", "interval_seconds": 0},
+    # include_memory=False because a beat can land in a group; quoting a stored memory there leaks it.
+    "proactive": {"enabled": False, "platform": "", "target": "", "interval_seconds": 0,
+                  "include_memory": False},
     "limits": {"max_messages_per_minute": 6, "max_message_chars": 800},
 }
 
@@ -136,13 +138,20 @@ def validate(cfg: dict) -> list[str]:
         if not target:
             problems.append("proactive: target chat/channel id is empty")
         else:
+            # only the chat/channel list counts here: a user id is not a place a beat may speak
             allow_keys = ("allow_chat_ids",) if platform == "telegram" else ("allow_channel_ids",)
-            allow = []
-            for key in allow_keys + ("allow_user_ids",):
-                allow.extend(str(v) for v in ((cfg.get(platform) or {}).get(key) or []))
+            allow = [str(v) for v in ((cfg.get(platform) or {}).get(allow_keys[0]) or [])]
             if target not in allow:
                 # an unattended beat must not speak somewhere the allowlist would never have accepted
                 problems.append(f"proactive: target {target} is not in the {platform} allowlist")
+        interval = proactive.get("interval_seconds") or 0
+        try:
+            interval = int(interval)
+        except (TypeError, ValueError):
+            problems.append("proactive: interval_seconds is not an integer")
+        else:
+            if interval < 0 or 0 < interval < 30:
+                problems.append("proactive: interval_seconds must be 0 (inherit) or at least 30")
     return problems
 
 
@@ -208,7 +217,11 @@ class Router:
         body = (text or "").strip()
         if not body or not self.allowed(platform, chat_id, user_id):
             return None
-        if self.rate_limited(chat_id):
+        with self.lock:
+            # two platform threads share this counter table; a read-modify-write outside the lock can
+            # undercount and let the burst through
+            limited = self.rate_limited(chat_id)
+        if limited:
             print(f"[bot] rate limit hit for {platform} chat {chat_id}; message dropped",
                   file=sys.stderr)
             return None
@@ -275,13 +288,18 @@ class BeatLoop:
 
     def __init__(self, cfg: dict, state: dict, send, now_fn=None, lock=None,
                  stop: threading.Event | None = None, interval: int | None = None):
-        self.cfg = cfg
+        section = cfg.get("proactive") or {}
+        # a beat may land in a group, so only a target the user explicitly trusts gets memory lines
+        self.cfg = {**cfg, "beat": {**cfg["beat"],
+                                    "include_memory": bool(section.get("include_memory", False))}}
         self.state = state
         self.send = send
         self.now_fn = now_fn or (lambda: datetime.now().replace(microsecond=0))
         self.lock = lock or threading.Lock()
         self.stop = stop or threading.Event()
-        self.interval = interval or int(cfg["beat"].get("interval_seconds", 900))
+        raw = interval or int(cfg["beat"].get("interval_seconds", 900))
+        # a zero/negative interval would spin: never beat faster than every 30 seconds
+        self.interval = max(30, int(raw))
 
     def beat_once(self) -> bool:
         delivered = []
@@ -322,7 +340,12 @@ class TelegramBot:
         self.state = router.state
 
     def poll_once(self) -> int:
-        offset = int(self.state.get("telegram_offset") or 0)
+        try:
+            offset = int(self.state.get("telegram_offset") or 0)
+        except (TypeError, ValueError):
+            # a hand-edited state file must not wedge polling in a retry loop
+            print("warning: telegram_offset is not a number; polling from 0", file=sys.stderr)
+            offset = 0
         params = {"timeout": 20, "allowed_updates": json.dumps(["message"])}
         if offset:
             params["offset"] = offset
@@ -337,7 +360,9 @@ class TelegramBot:
             if self.dispatch(update):
                 handled += 1
         if data.get("result"):
-            fish.save_state(Path(self.cfg["state_file"]), self.state)
+            with self.router.lock:
+                # the beat thread may be writing the same state; keep the two snapshots serialised
+                fish.save_state(Path(self.cfg["state_file"]), self.state)
         return handled
 
     def dispatch(self, update: dict) -> bool:
@@ -460,12 +485,15 @@ class DiscordBot:
             try:
                 conn = self.socket_factory(self.gateway_url(), timeout=60).connect()
                 print("[discord] gateway connected", file=sys.stderr)
-                while not self.stopping.is_set():
-                    raw = conn.recv()
-                    if raw is None:
-                        break
-                    self.handle_payload(json.loads(raw), conn)
-                conn.close()
+                try:
+                    while not self.stopping.is_set():
+                        raw = conn.recv()
+                        if raw is None:
+                            break
+                        self.handle_payload(json.loads(raw), conn)
+                finally:
+                    # op 7/9 raise to force a reconnect; the socket still has to be closed here
+                    conn.close()
             except KeyboardInterrupt:
                 self.stopping.set()
                 break
@@ -512,6 +540,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.once:
             if "telegram" in platforms:
                 TelegramBot(cfg, router).poll_once()
+            if "discord" in platforms:
+                print("note: --once only runs one Telegram poll; Discord needs the gateway loop, "
+                      "so nothing was pulled for it", file=sys.stderr)
             return 0
         threads: list[threading.Thread] = []
         if "telegram" in platforms:

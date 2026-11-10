@@ -24,6 +24,7 @@
     "enabled": false,
     "platform": "telegram",
     "target": 123456789,
-    "interval_seconds": 900
+    "interval_seconds": 900,
+    "include_memory": false
   }
 }

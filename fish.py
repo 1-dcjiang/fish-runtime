@@ -493,10 +493,14 @@ def cmd_tick(cfg: dict, state: dict, now: datetime, send=None) -> int:
     persona = load_persona(cfg)
 
     if may:
+        # a beat can land in a group chat; quoting a stored memory there would leak it to everyone in the
+        # room, so the bot turns this off by default and only a private target should re-enable it
+        include_memory = bool(cfg["beat"].get("include_memory", True))
         peak = peak_memory(entries, float(cfg["beat"].get("min_weight", 0.5)))
-        ref = peak["text"][:90]
+        ref = peak["text"][:90] if include_memory else ""
         mood = mood_now(state, now)
-        lines = [f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in entries[:5]]
+        lines = ([f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in entries[:5]]
+                 if include_memory else [])
         text = adapters.ModelClient(cfg["model"], persona).compose(
             ref=ref, mood=mood, proactive=True, memory_lines=lines
         )

@@ -52,7 +52,7 @@ export FISH_TG_TOKEN=...          # @BotFather → /newbot → token
 export FISH_DISCORD_TOKEN=...     # Developer Portal → Bot → Reset Token
 python bot.py --config config.bot.example.json
 python bot.py --config config.bot.example.json --platform telegram
-python bot.py --config config.bot.example.json --once     # one poll round, then exit
+python bot.py --config config.bot.example.json --once     # one Telegram poll round, then exit
 ```
 
 Setup, in the order that actually matters:
@@ -94,6 +94,9 @@ long answer does not get rejected with a 400.
 - Quiet hours, the 20-minute gap since your last message, `max_messages_per_day`, the idle threshold and
   "is anything strong enough to mention" all still apply. This is the CLI's `decide()`, not a second policy
   that could drift from it.
+- **A beat does not quote a stored memory by default** (`include_memory: false`). A beat can land in a group,
+  and a line like "I remember you are a first-year student in Suzhou" would leak that to everyone in the
+  room. Turn it on only when `target` is a private chat.
 - Off by default. A bot that messages you first is a behaviour you opt into, not a default.
 
 Turns and beats share one `state` dict, so the process serialises them with a lock: a beat cannot interleave
@@ -220,14 +223,15 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-87 tests, no network, no real clock. The 50 CLI cases plus 37 bot cases: config validation refusing to start
+93 tests, no network, no real clock. The 50 CLI cases plus 43 bot cases: config validation refusing to start
 without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
 parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
 Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gateway identify with the right
 intents, WebSocket frame roundtrips at 7, 200 and 70,000 bytes, and the proactive beat: a target outside the
-allowlist refused at startup, an idle character speaking on its own, a recent message keeping it quiet, the
-daily cap, and a failed send not counting toward it.
+allowlist refused at startup, a user id not accepted as a target, a memory-free beat by default, opt-in
+memory quoting, a recent message keeping it quiet, the daily cap, a failed send not counting toward it, a
+corrupt `telegram_offset` recovering instead of wedging polling, and a spinning interval clamped.
 
 The 50 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
 format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still
@@ -256,6 +260,8 @@ a missing `cycle_script` being announced, `--no-record`, a greeting not becoming
   single unbroken string longer than the limit with no spaces is cut mid-word.
 - **Bot mode is one process per token.** Telegram's `getUpdates` cannot coexist with a webhook, and two
   pollers on one token will steal updates from each other.
+- **No graceful SIGTERM handler.** Ctrl-C is clean; a `systemctl stop` kills the loop where it stands. State
+  is written after every turn and every beat, so the loss is bounded to the message in flight.
 - **Discord disconnects re-identify, not resume.** A temporary outage costs a fresh session; fine for a
   personal bot, wrong for a large one.
 - **The Discord heartbeat does not watch for missing ACKs.** If the gateway stops answering, the socket

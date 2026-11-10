@@ -98,10 +98,22 @@ class WebSocket:
 
     def connect(self) -> "WebSocket":
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
-        if self.secure:
-            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=self.host)
-        raw.settimeout(self.timeout)
-        self.sock = raw
+        try:
+            if self.secure:
+                raw = ssl.create_default_context().wrap_socket(raw, server_hostname=self.host)
+            raw.settimeout(self.timeout)
+            self.sock = raw
+            self._handshake(raw)
+            return self
+        except Exception:
+            # a refused handshake must not leak a socket, least of all inside a reconnect loop
+            try:
+                raw.close()
+            finally:
+                self.sock = None
+            raise
+
+    def _handshake(self, raw) -> None:
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
             f"GET {self.path} HTTP/1.1\r\n"
@@ -126,7 +138,6 @@ class WebSocket:
             __import__("hashlib").sha1((key + GUID).encode()).digest()).decode()
         if accept not in head.decode(errors="replace"):
             raise WebSocketError("bad Sec-WebSocket-Accept")
-        return self
 
     def _send_frame(self, payload: bytes, opcode: int) -> None:
         if not self.sock:
