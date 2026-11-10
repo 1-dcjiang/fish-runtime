@@ -129,30 +129,33 @@ class ModelClient:
 
 
 class Channel:
-    """Where the character speaks. stdout for tests, telegram/webhook for real life."""
+    """Where the character speaks. stdout for tests, telegram/webhook/discord for real life."""
 
     def __init__(self, config: dict):
         self.config = config or {}
         self.type = self.config.get("type", "stdout")
 
-    def send(self, text: str) -> dict:
+    def send(self, text: str, target: str | None = None) -> dict:
         if self.type == "stdout":
             print(text)
             return {"channel": "stdout", "ok": True}
         if self.type == "telegram":
             token = os.environ.get(self.config.get("token_env", "FISH_TG_TOKEN"))
-            chat_id = os.environ.get(self.config.get("chat_id_env", "FISH_TG_CHAT"))
+            chat_id = target or os.environ.get(self.config.get("chat_id_env", "FISH_TG_CHAT"))
             if not token or not chat_id:
                 # Do not echo the message body into logs: it may be the user's private text.
                 print(f"[channel] telegram not configured ({self.config.get('token_env')}/"
                       f"{self.config.get('chat_id_env')} unset); 1 message dropped",
                       file=sys.stderr)
                 return {"channel": "telegram", "ok": False, "error": "missing token or chat id"}
-            return self._post_json(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                {"chat_id": chat_id, "text": text},
-                "telegram",
-            )
+            return send_telegram(token, chat_id, text)
+        if self.type == "discord":
+            token = os.environ.get(self.config.get("token_env", "FISH_DISCORD_TOKEN"))
+            channel_id = target or os.environ.get(self.config.get("channel_id_env", ""))
+            if not token or not channel_id:
+                print("[channel] discord not configured; 1 message dropped", file=sys.stderr)
+                return {"channel": "discord", "ok": False, "error": "missing token or channel id"}
+            return send_discord(token, channel_id, text)
         if self.type == "webhook":
             url = self.config.get("url")
             if not url:
@@ -171,3 +174,65 @@ class Channel:
                 return {"channel": name, "ok": 200 <= response.status < 300}
         except Exception as exc:
             return {"channel": name, "ok": False, "error": str(exc)}
+
+
+TELEGRAM_LIMIT = 4096
+DISCORD_LIMIT = 2000
+
+
+def split_message(text: str, limit: int) -> list[str]:
+    """Chunk a reply at a platform's hard limit, preferring newlines and then spaces."""
+    body = (text or "").strip()
+    if not body:
+        return []
+    if len(body) <= limit:
+        return [body]
+    chunks, rest = [], body
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
+def send_telegram(token: str, chat_id: str | int, text: str) -> dict:
+    sent = 0
+    for chunk in split_message(text, TELEGRAM_LIMIT):
+        outcome = Channel._post_json(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+            "telegram",
+        )
+        if not outcome.get("ok"):
+            return {**outcome, "sent": sent}
+        sent += 1
+    return {"channel": "telegram", "ok": True, "sent": sent}
+
+
+def send_discord(token: str, channel_id: str | int, text: str) -> dict:
+    sent = 0
+    for chunk in split_message(text, DISCORD_LIMIT):
+        data = json.dumps({"content": chunk}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bot {token}",
+                     "User-Agent": "fish-runtime (https://github.com/1-dcjiang/fish-runtime)"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                if not 200 <= response.status < 300:
+                    return {"channel": "discord", "ok": False,
+                            "error": f"HTTP {response.status}", "sent": sent}
+        except Exception as exc:
+            return {"channel": "discord", "ok": False, "error": str(exc), "sent": sent}
+        sent += 1
+    return {"channel": "discord", "ok": True, "sent": sent}

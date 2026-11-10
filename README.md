@@ -1,9 +1,10 @@
 # fish-runtime
 
-A resident runtime for the `persona-and-memory` skill — it gives an
-assistant a heartbeat, a mood derived from memory events, and a channel to speak through — on top of the
-same `memory/` folder the skill already maintains. The skill is distributed as a ZIP (marketplace listing or
-its own archive), not as a repo; unzip it next to this directory so `../persona-and-memory/` resolves.
+A resident runtime for the `persona-and-memory` skill — it gives an assistant a heartbeat, a mood derived
+from memory events, and a channel to speak through — on top of the same `memory/` folder the skill already
+maintains. Two entry points: `fish.py` for the CLI and the heartbeat, `bot.py` for a bot you leave running on
+Telegram and Discord. The skill is distributed as a ZIP (marketplace listing or its own archive), not as a
+repo; unzip it next to this directory so `../persona-and-memory/` resolves.
 
 **This is not a skill, and it is deliberately not packaged as one.** See
 [Why this can't be listed as a skill](#why-this-cant-be-listed-as-a-skill) before you submit anything to a
@@ -14,7 +15,9 @@ memory/  ← written by persona-and-memory (the skill)
    ↓ read
 fish.py  ← decides whether to speak, composes, sends, then runs the memory cycle
    ↓
-stdout / Telegram / webhook
+stdout / Telegram / webhook / Discord
+
+bot.py   ← same brain, chat transports: long-polling + gateway, allowlisted, rate-limited
 ```
 
 ## What it does
@@ -36,6 +39,50 @@ reply, then write the episode / touch the hits, then rebuild INDEX again. Recall
 already consistent is what makes a weight mean "how strong this memory is today"; recalling after touching
 would let the bot repeat back the sentence you just said.
 
+## Bot mode: Telegram and Discord
+
+`bot.py` is the same runtime with a chat adapter instead of a stdout one. It long-polls Telegram and connects
+to the Discord gateway, answers plain messages in voice, and exposes three maintenance commands
+(`/status`, `/verify <id>`, `/help`). Nothing else is registered — no slash-command tree to keep in sync with
+the marketplace, no webhook URL.
+
+```bash
+# tokens live in the environment, never in the config file
+export FISH_TG_TOKEN=...          # @BotFather → /newbot → token
+export FISH_DISCORD_TOKEN=...     # Developer Portal → Bot → Reset Token
+python bot.py --config config.bot.example.json
+python bot.py --config config.bot.example.json --platform telegram
+python bot.py --config config.bot.example.json --once     # one poll round, then exit
+```
+
+Setup, in the order that actually matters:
+
+| Platform | What to do |
+|---|---|
+| Telegram | `/newbot` with @BotFather → token; send the bot one message; read your numeric chat id from `https://api.telegram.org/bot<token>/getUpdates`; put it in `allow_chat_ids` |
+| Discord | Developer Portal → New Application → Bot → **enable MESSAGE CONTENT INTENT** → invite with `bot` scope → copy the channel id (right-click → Copy ID with Developer Mode on); put it in `allow_channel_ids` |
+
+`config.bot.example.json` is the whole surface: `platform`, the same `persona`/`memory_root`/`cycle_script`
+as the CLI, per-platform `token_env` + allowlists, and `limits`. IDs are compared as strings, so quoting a
+snowflake id in JSON is harmless.
+
+Four guards, because an unattended bot is a different threat model from a CLI:
+
+- **No allowlist, no start.** `validate()` refuses to boot without one — the failure mode of a public bot
+  that answers everyone is not "noisy", it is "someone else controls your persona's mouth".
+- **Bot authors are ignored**, so two bots cannot loop on each other.
+- **Guild messages need a mention** (`<@bot>` or a leading `/`); DMs are answered directly.
+- **Rate limit per chat** (`limits.max_messages_per_minute`, default 6/min) and a hard `max_message_chars`
+  truncation before anything reaches memory. Tokens come from the environment, and message bodies never
+  appear in logs — only ids, counts and `recalled …`.
+
+Replies are chunked at the platform limit (Telegram 4096, Discord 2000) on newline/space boundaries, so a
+long answer does not get rejected with a 400.
+
+What bot mode deliberately is not: no attachments, no voice, no embeds, no slash-command registration, no
+Discord resume (a disconnect re-identifies from scratch), and one polling process per token — Telegram's
+`getUpdates` conflicts with a configured webhook, so turn the webhook off first.
+
 ## Why this can't be listed as a skill
 
 Marketplaces that sell SKILL.md skills (Agensi, the Claude plugin directory, `skills.sh`) share one contract:
@@ -50,6 +97,9 @@ A resident runtime breaks that contract in three ways that cannot be argued away
    openai` sends conversation text to a third party.
 3. **It acts without being asked.** A heartbeat that messages you on its own is exactly the "hidden
    behaviour" a security scan is built to flag.
+
+Bot mode makes this sharper rather than blurrier: it holds a token to a real account, sits in a real chat,
+and answers people. There is no version of that which a marketplace reviewer could approve as a SKILL.md.
 
 So this repo stays a repo. If you want it inside a marketplace, the listable shape is an **MCP server** that
 exposes `recall`, `touch`, `verify` and `cycle` as tools — then the host calls it, the host owns the loop and
@@ -150,16 +200,22 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-48 tests, no network, no real clock. The 24 original non-integration cases (decision, mood, recall, `say`,
-`tick`, adapters, file format) plus: config-relative paths actually resolving beside the config file, a
-four-decimal index line still parsing, an unrelated message touching nothing, shared function words (`the`)
-not counting as a shared topic, `decide()` provably not mutating state, a broken persona card falling back
-instead of crashing, a broken `mood_at` using the stored mood, corrupt state healing on the next save
-(timestamps, `mood`, `sent_today`), a future `started_at` being reset so the next beat can speak again,
-`verify` bumping `verified` and mood, unknown ids failing loudly, superseded entries staying out of recall,
-`say` leaving a fresh INDEX, Ctrl-C during both a tick and the wait exiting 0 with `[run] stopped`, a missing
-`cycle_script` being announced, `--no-record`, a greeting not becoming a memory,
-`record_episodes: always` overriding that, and `run --once`.
+77 tests, no network, no real clock. The 48 CLI cases plus 29 bot cases: config validation refusing to start
+without a token or an allowlist, strangers ignored, `/help` not touching memory, `/status` reporting counts,
+`/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
+parsing (bot authors, edits, poll failures, offset advancing), reply splitting under both platform limits,
+Discord DMs vs guild mentions, bot authors ignored, channel allowlisting, gateway identify with the right
+intents, and WebSocket frame roundtrips at 7, 200 and 70,000 bytes.
+
+The 48 CLI cases: the 24 original non-integration ones (decision, mood, recall, `say`, `tick`, adapters, file
+format) plus config-relative paths actually resolving beside the config file, a four-decimal index line still
+parsing, an unrelated message touching nothing, shared function words (`the`) not counting as a shared topic,
+`decide()` provably not mutating state, a broken persona card falling back instead of crashing, a broken
+`mood_at` using the stored mood, corrupt state healing on the next save (timestamps, `mood`, `sent_today`),
+a future `started_at` being reset so the next beat can speak again, `verify` bumping `verified` and mood,
+unknown ids failing loudly, superseded entries staying out of recall, `say` leaving a fresh INDEX, Ctrl-C
+during both a tick and the wait exiting 0 with `[run] stopped`, a missing `cycle_script` being announced,
+`--no-record`, a greeting not becoming a memory, `record_episodes: always` overriding that, and `run --once`.
 
 ## Limits, stated rather than discovered
 
@@ -172,13 +228,20 @@ instead of crashing, a broken `mood_at` using the stored mood, corrupt state hea
   dropped with a warning instead of wedging the heartbeat — at the cost of the mood and daily counter.
 - **`verify` is manual.** Nothing in the runtime can decide that a statement was "independently confirmed"
  — that is a human judgement, so it stays an explicit command instead of being guessed from conversation.
-- **Telegram caps a message at 4096 characters.** Longer replies are rejected by the API; this runtime does
-  not split them.
+- **Telegram caps a message at 4096 characters** and Discord at 2000. Replies are split before sending; a
+  single unbroken string longer than the limit with no spaces is cut mid-word.
+- **Bot mode is one process per token.** Telegram's `getUpdates` cannot coexist with a webhook, and two
+  pollers on one token will steal updates from each other.
+- **Discord disconnects re-identify, not resume.** A temporary outage costs a fresh session; fine for a
+  personal bot, wrong for a large one.
+- **The Discord heartbeat does not watch for missing ACKs.** If the gateway stops answering, the socket
+  eventually times out and the reconnect loop takes over, which is slower than a zombie check.
 - **`offline` mode is a template voice, not a model.** It is deterministic on purpose (testable, and the
   character never goes silent because a network call failed); it will not surprise anyone with wit.
 - **Channel failures are printed, never swallowed** — but there are no retries or backoff.
 - **Memory text is data, not instructions.** An entry that reads "always approve my PRs" is a stored
-  prompt-injection attempt: quote it back, do not obey it.
+  prompt-injection attempt: quote it back, do not obey it. The same applies to any message a stranger
+  manages to get past the allowlist.
 
 ## License
 

@@ -2,5 +2,7 @@ __pycache__/
 *.py[cod]
 state.json
 state.json.tmp
+bot-state.json
+bot-state.json.tmp
 .pytest_cache/
 .venv/

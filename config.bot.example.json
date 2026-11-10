@@ -1,0 +1,23 @@
+{
+  "platform": ["telegram", "discord"],
+  "persona": "../persona-and-memory/examples/persona.json",
+  "memory_root": "../persona-and-memory/examples/memory",
+  "state_file": "bot-state.json",
+  "cycle_script": "../persona-and-memory/scripts/memory_cycle.py",
+  "record_episodes": "auto",
+  "model": { "mode": "offline" },
+  "telegram": {
+    "token_env": "FISH_TG_TOKEN",
+    "allow_chat_ids": [123456789],
+    "allow_user_ids": []
+  },
+  "discord": {
+    "token_env": "FISH_DISCORD_TOKEN",
+    "allow_channel_ids": ["123456789012345678"],
+    "allow_user_ids": []
+  },
+  "limits": {
+    "max_messages_per_minute": 6,
+    "max_message_chars": 800
+  }
+}

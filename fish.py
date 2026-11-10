@@ -497,14 +497,12 @@ def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
     return 0
 
 
-def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = True) -> int:
-    """Reply to one user message.
+def compose_reply(cfg: dict, state: dict, now: datetime, text: str,
+                  record: bool = True) -> dict:
+    """Everything one turn needs except the transport: recall, reply text, and the memory writes.
 
-    Order is deliberate: settle storage first (cycle → decay, fold, rebuild INDEX), then recall and
-    reply, then write the episode/touch and refresh INDEX. Recalling from an already-consistent store
-    is what makes the weights mean "how strong is this memory today" instead of "how strong it was
-    before the last beat". Remembering the user's own sentence before replying would make the bot
-    parrot it back, so that is not done.
+    The transport (stdout, Telegram, a bot) only sends `reply`; all state changes happen here so a
+    CLI turn and a chat turn cannot drift apart.
     """
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
@@ -523,7 +521,6 @@ def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = Tru
         memory_lines=[f"- {e['id']} [{e['status']}] {e['kind']} | {e['text']}" for e in hits],
         user_text=text,
     )
-    result = adapters.Channel(cfg["channel"]).send(reply)
 
     episode = None
     if record and should_record(cfg, text):
@@ -551,9 +548,24 @@ def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = Tru
     state["mood"] = mood
     state["mood_at"] = now.isoformat()
     save_state(Path(cfg["state_file"]), state)
+    return {"reply": reply, "hits": [e["id"] for e in hits],
+            "episode": episode.name if episode else None}
 
-    kept = episode.name if episode else "nothing (nothing durable in it)"
-    print(f"[say] recorded {kept}, recalled {', '.join(e['id'] for e in hits) or 'nothing'}")
+
+def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = True) -> int:
+    """Reply to one user message on the configured channel.
+
+    Order is deliberate: settle storage first (cycle → decay, fold, rebuild INDEX), then recall and
+    reply, then write the episode/touch and refresh INDEX. Recalling from an already-consistent store
+    is what makes the weights mean "how strong is this memory today" instead of "how strong it was
+    before the last beat". Remembering the user's own sentence before replying would make the bot
+    parrot it back, so that is not done.
+    """
+    turn = compose_reply(cfg, state, now, text, record=record)
+    result = adapters.Channel(cfg["channel"]).send(turn["reply"])
+
+    kept = turn["episode"] or "nothing (nothing durable in it)"
+    print(f"[say] recorded {kept}, recalled {', '.join(turn['hits']) or 'nothing'}")
     return 0 if result.get("ok") else 1
 
 
