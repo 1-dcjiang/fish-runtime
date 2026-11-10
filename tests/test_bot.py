@@ -178,6 +178,29 @@ class ContextTests(BotFixture):
         self.assertEqual(len(group_entries), 1)
         self.assertEqual(list((self.memory / "entries").glob("*.md")), [])
 
+    def test_always_recording_is_not_downgraded_for_a_chat(self):
+        self.cfg["record_episodes"] = "always"
+        group = bot.context_cfg(self.cfg, "-100999")
+        self.assertEqual(group["record_episodes"], "always")
+        self.assertTrue(fish.should_record(group, "好"))
+        self.assertEqual(bot.context_cfg(self.cfg, "private")["record_episodes"], "always")
+        self.cfg["chats"] = {"-100999": {"record": False}}
+        self.assertEqual(bot.context_cfg(self.cfg, "-100999")["record_episodes"], "off")
+
+    def test_a_private_state_override_keeps_the_polling_offset_there(self):
+        custom = self.dir / "dm-state.json"
+        self.cfg["chats"] = {"private": {"state_file": str(custom)}}
+        http = FakeHTTP([{"ok": True, "result": [
+            {"update_id": 77, "message": {"text": "hello", "chat": {"id": "111", "type": "private"},
+                                          "from": {"id": "5", "is_bot": False}}}]}])
+        b = bot.TelegramBot(self.cfg, bot.Contexts(self.cfg),
+                            http=http, send=lambda token, chat, text: {"ok": True})
+        self.assertEqual(b.poll_once(), 1)
+        saved = json.loads(custom.read_text(encoding="utf-8"))
+        self.assertEqual(saved["telegram_offset"], 78)
+        # the base file only exists when something actually writes it; the offset must not go there
+        self.assertFalse(self.state_file.exists())
+
 
 class ValidateTests(BotFixture):
     def test_no_allowlist_and_missing_token_are_reported(self):

@@ -320,8 +320,10 @@ def context_cfg(cfg: dict, key: str) -> dict:
         ccfg["persona"] = entry["persona"]
     quoting = (cfg.get("reply") or {}).get("include_memory", True)
     ccfg["reply"] = {"include_memory": bool(entry.get("include_memory", quoting))}
-    recording = cfg.get("record_episodes") != "off"
-    ccfg["record_episodes"] = "auto" if bool(entry.get("record", recording)) else "off"
+    policy = str(cfg.get("record_episodes") or "auto").lower()
+    # a per-chat `record` flips the switch, but `always` is a policy, not a switch: keep it
+    ccfg["record_episodes"] = ("off" if not bool(entry.get("record", policy != "off"))
+                               else ("always" if policy == "always" else "auto"))
 
     overlay = dict(entry.get("proactive") or {})
     if key == "private":
@@ -378,6 +380,11 @@ class Contexts:
     def state(self) -> dict:
         """The private conversation's state, which also carries the polling offset."""
         return self.get("private")[1]
+
+    @property
+    def state_file(self) -> str:
+        """Where that state is saved — the private chat's own file, even when it overrides the base."""
+        return self.get("private")[0]["state_file"]
 
     def items(self):
         return list(self._map.items())
@@ -690,9 +697,7 @@ class BeatLoop:
         return bool(delivered)
 
     def run(self) -> int:
-        section = self.cfg.get("proactive") or {}
-        print(f"[beat] proactive every {self.interval}s to {section.get('platform')} "
-              f"{section.get('target')}", file=sys.stderr)
+        # main() already announced this beat once; a second copy here only makes the startup log noisy
         while not self.stop.is_set():
             try:
                 self.beat_once()
@@ -718,6 +723,8 @@ class TelegramBot:
         self.send = send or adapters.send_telegram
         self.token = os.environ.get(cfg["telegram"].get("token_env", "FISH_TG_TOKEN"), "")
         self.state = router.state
+        # where the polling offset lives: the conversation that owns this state, not the base path
+        self.state_file = Path(getattr(router, "state_file", None) or cfg["state_file"])
         self.poll_ok = True
 
     def poll_once(self) -> int:
@@ -745,7 +752,7 @@ class TelegramBot:
         if data.get("result"):
             with self.router.lock:
                 # the beat thread may be writing the same state; keep the two snapshots serialised
-                fish.save_state(Path(self.cfg["state_file"]), self.state)
+                fish.save_state(self.state_file, self.state)
         return handled
 
     def dispatch(self, update: dict) -> bool:

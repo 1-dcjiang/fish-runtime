@@ -104,7 +104,7 @@ about you — and a quiet group does not put the DM on cooldown for 20 minutes.
 | Conversation | Memory | State | Quotes memory | Records | Speaks first |
 |---|---|---|---|---|---|
 | `private` | `memory_root` | `state_file` | `reply.include_memory` | global `record_episodes` | global `proactive` |
-| each group `<id>` | `memory_root/groups/<id>/` | `bot-state.<id>.json` | the group's own `include_memory` | the group's own `record` | **off**, unless that group's own `proactive.enabled` is true |
+| each group `<id>` | `memory_root/groups/<id>/` | `<state stem>.<id>.json` (default `bot-state.<id>.json`) | the group's own `include_memory` | the group's own `record` | **off**, unless that group's own `proactive.enabled` is true |
 
 Each key under `chats` is either `private` or a chat id, and each accepts `include_memory`, `record`,
 `memory_root`, `state_file`, `persona`, and a nested `proactive` (`enabled`, `target`, `interval_seconds`,
@@ -137,6 +137,15 @@ python setup.py set chats.-100999.proactive.quiet_hours=[22,8]
 
 A beat only speaks into a group whose id is in that platform's allowlist; every group that beats runs its
 own loop with its own interval, so a busy channel and a quiet one do not share a clock.
+
+**The unit of isolation is the conversation, not the person.** One group has one store: what Alice says
+there can be recalled when Bob asks something similar, because a group is a room the character is in. If
+that is not what you want, silence the group's quoting (`chats.<id>.include_memory=false`), stop it writing
+(`chats.<id>.record=false`), or point it at a store you wipe.
+
+Two defaults are intentionally asymmetric: a group **does** quote memory when it answers (an answer is
+addressed to the person who asked), while a group's **proactive beat** does **not** quote it by default
+(nobody asked, and the beat may land in an audience the character cannot see). Both are one line to change.
 
 ### Configure it by talking, not by editing JSON
 
@@ -321,13 +330,14 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-121 tests, no network, no real clock. 50 CLI cases, 57 bot cases and 14 configurator cases: config
+123 tests, no network, no real clock. 50 CLI cases, 59 bot cases and 14 configurator cases: config
 validation refusing to start
 without a token or an allowlist, a wrong shape reported instead of crashing a beat, strangers ignored, a
 trusted user id not trusted in an unlisted group, `/help` not touching memory, `/status` reporting counts,
 `/status@fish_bot` parsed in groups, replies quoting memory by default and the one switch turning that off,
 a group getting its own memory store and state file, per-group quoting and recording, its own beat interval,
-and a group turn leaving the private store untouched,
+`always` not being downgraded for a chat, a private state override keeping the polling offset in its own
+file, and a group turn leaving the private store untouched,
 `/verify` actually confirming, rate limiting on the seventh message, input truncation, Telegram update
 parsing (bot authors, edits, poll failures, offset advancing, a failed poll backing off instead of hammering
 the API), reply splitting under both platform limits,
