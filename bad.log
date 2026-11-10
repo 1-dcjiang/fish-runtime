@@ -1,2 +1,0 @@
-error: proactive: target 999999 is not in the telegram allowlist
-error: refusing to start (fix the items above; tokens go in the environment)

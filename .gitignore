@@ -6,3 +6,4 @@ bot-state.json
 bot-state.json.tmp
 .pytest_cache/
 .venv/
+*.log
