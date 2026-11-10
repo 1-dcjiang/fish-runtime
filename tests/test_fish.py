@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
@@ -500,6 +500,52 @@ class RuntimeHygieneTests(FishTest):
         hits = fish.recall(entries, "remember my docker builds need the --platform linux/amd64 flag")
         self.assertEqual([e["id"] for e in hits], ["m-20261109-01"],
                          "the word 'the' must not make two unrelated memories look related")
+
+    def test_state_with_non_numeric_fields_self_heals(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        base = {"mood": "abc", "mood_at": self.now, "last_user_at": "2026-11-09T20:00",
+                "last_nudge_at": None, "sent_today": "many", "sent_day": self.today,
+                "started_at": "2026-11-01T00:00"}
+        self.state_file.write_text(json.dumps(base), encoding="utf-8")
+        self.run_cmd(["tick", "--config", str(self.dir / "config.json"), "--now", self.now])
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mood"], 0.0)
+        self.assertEqual(saved["sent_today"], 1)
+
+    def test_ctrl_c_during_a_tick_stops_cleanly(self):
+        from unittest import mock
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        self.seed_state()
+        buffer = io.StringIO()
+        with mock.patch.object(fish, "cmd_tick", side_effect=KeyboardInterrupt), redirect_stdout(buffer):
+            self.assertEqual(fish.main(["run", "--config", str(self.dir / "config.json"),
+                                        "--now", self.now]), 0)
+        self.assertIn("[run] stopped", buffer.getvalue())
+
+    def test_a_future_timestamp_is_treated_as_absent(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        entries = self.build_index()
+        state = {"last_user_at": "2026-11-11T09:00", "sent_today": 0, "sent_day": self.today,
+                 "started_at": "2026-11-01T00:00"}
+        may, reason = fish.decide(fish.merge(fish.DEFAULTS, {}), state, entries,
+                                  datetime(2026, 11, 10, 10, 0))
+        self.assertTrue(may, reason)
+        self.assertNotIn("-", reason)
+
+    def test_no_cycle_script_is_announced(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config(cycle_script=None)
+        self.seed_state(last_user_at="2026-11-09T20:00")
+        errors = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            self.assertEqual(fish.main(["tick", "--config", str(self.dir / "config.json"),
+                                        "--now", self.now]), 0)
+        self.assertIn("no cycle_script configured", errors.getvalue())
 
     def test_missing_state_file_is_not_fatal(self):
         self.assertIsInstance(fish.load_state(self.dir / "missing.json"), dict)

@@ -31,6 +31,11 @@ stdout / Telegram / webhook
 the clock said". That is what makes the tests below possible. (`run` honours it for the first beat only;
 after that a long-running process must follow the real clock.)
 
+Inside `say` the order is deliberate: run the cycle first (decay, fold, rebuild INDEX), then recall and
+reply, then write the episode / touch the hits, then rebuild INDEX again. Recalling from a store that is
+already consistent is what makes a weight mean "how strong this memory is today"; recalling after touching
+would let the bot repeat back the sentence you just said.
+
 ## Why this can't be listed as a skill
 
 Marketplaces that sell SKILL.md skills (Agensi, the Claude plugin directory, `skills.sh`) share one contract:
@@ -66,6 +71,10 @@ python fish.py run    --config config.example.json
 `../persona-and-memory/examples/`, so the demo works without setup. Relative paths resolve against the
 **config file's** directory, not the shell's working directory.
 
+Note that this demo writes into the skill's own `examples/memory/` (the `say` line records an episode there).
+That is fine for a first look; for anything real, point `memory_root` at your own `memory/` folder, or add
+`--no-record` to `say`.
+
 Python 3.10+. No dependencies outside the standard library.
 
 **Companion version.** The runtime does not implement the memory arithmetic itself; it calls the skill's
@@ -92,6 +101,20 @@ Python 3.10+. No dependencies outside the standard library.
 | `beat.nudge_cooldown_hours` | minimum gap between two unprompted messages |
 | `beat.max_messages_per_day` | hard daily cap; a **failed send does not consume quota** |
 | `beat.min_weight` | ignore memories lighter than this when looking for something worth saying |
+
+`config.example.json` is deliberately offline-only. To point it at a real model:
+
+```json
+"model": {
+  "mode": "openai",
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "api_key_env": "DEEPSEEK_API_KEY"
+}
+```
+
+The key is read from the environment, never from the config file. If the variable is unset or the call
+fails, the runtime warns on stderr and falls back to the offline voice rather than going silent.
 
 ### When it stays silent
 
@@ -127,14 +150,15 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-43 tests, no network, no real clock. The 24 original decision/mood/recall cases plus: config-relative paths
-actually resolving beside the config file, a four-decimal index line still parsing, an unrelated message
-touching nothing, shared function words (`the`) not counting as a shared topic, `decide()` provably not
-mutating state, a broken persona card falling back instead of crashing, a broken `mood_at` using the stored
-mood, corrupt state timestamps healing on the next save, `verify` bumping `verified` and mood, unknown ids
-failing loudly, superseded entries staying out of recall, `say` leaving a fresh INDEX, Ctrl-C while `run`
-waits exiting 0 with `[run] stopped`, `--no-record`, a greeting not becoming a memory,
-`record_episodes: always` overriding that, and `run --once`.
+47 tests, no network, no real clock. The 24 original non-integration cases (decision, mood, recall, `say`,
+`tick`, adapters, file format) plus: config-relative paths actually resolving beside the config file, a
+four-decimal index line still parsing, an unrelated message touching nothing, shared function words (`the`)
+not counting as a shared topic, `decide()` provably not mutating state, a broken persona card falling back
+instead of crashing, a broken `mood_at` using the stored mood, corrupt state healing on the next save
+(timestamps, `mood`, `sent_today`), a future timestamp being ignored, `verify` bumping `verified` and mood,
+unknown ids failing loudly, superseded entries staying out of recall, `say` leaving a fresh INDEX, Ctrl-C
+during both a tick and the wait exiting 0 with `[run] stopped`, a missing `cycle_script` being announced,
+`--no-record`, a greeting not becoming a memory, `record_episodes: always` overriding that, and `run --once`.
 
 ## Limits, stated rather than discovered
 

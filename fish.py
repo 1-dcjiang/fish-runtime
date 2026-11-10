@@ -131,6 +131,16 @@ def load_state(path: Path) -> dict:
     for key in TIMESTAMP_KEYS:
         if key in state and state[key] and parse_timestamp(state[key]) is None:
             state[key] = None
+    # a string where a number belongs must not reach float()/int() deep inside a tick
+    for key, cast, default in (("mood", float, 0.0), ("sent_today", int, 0)):
+        try:
+            state[key] = cast(state[key])
+        except (TypeError, ValueError):
+            print(f"warning: state {key}={state[key]!r} is not a number; reset to {default}",
+                  file=sys.stderr)
+            state[key] = default
+    if state.get("sent_day") is not None and not isinstance(state["sent_day"], str):
+        state["sent_day"] = None
     return state
 
 
@@ -269,6 +279,17 @@ def in_quiet_hours(now: datetime, quiet: list[int] | None) -> bool:
     return hour >= start or hour < end
 
 
+def in_the_past(stamp: datetime | None, now: datetime, label: str) -> datetime | None:
+    """A timestamp from the future is a corrupted clock, not a reason to stay silent for a day."""
+    if stamp is None:
+        return None
+    if stamp > now:
+        print(f"warning: state {label} is in the future ({stamp.isoformat()}); ignored",
+              file=sys.stderr)
+        return None
+    return stamp
+
+
 def decide(cfg: dict, state: dict, entries: list[dict], now: datetime) -> tuple[bool, str]:
     """Read-only decision: may the character speak now, and why not if not."""
     beat = cfg["beat"]
@@ -278,17 +299,18 @@ def decide(cfg: dict, state: dict, entries: list[dict], now: datetime) -> tuple[
     sent_today = 0 if sent_day != now.date().isoformat() else int(state.get("sent_today", 0))
     if sent_today >= int(beat.get("max_messages_per_day", 3)):
         return False, "daily_cap"
-    last_user = parse_timestamp(state.get("last_user_at"))
+    last_user = in_the_past(parse_timestamp(state.get("last_user_at")), now, "last_user_at")
     if last_user:
         gap = (now - last_user).total_seconds() / 60.0
         if gap < float(beat.get("min_gap_minutes", 20)):
             return False, f"recent_user_message ({int(gap)}m ago)"
-    last_nudge = parse_timestamp(state.get("last_nudge_at"))
+    last_nudge = in_the_past(parse_timestamp(state.get("last_nudge_at")), now, "last_nudge_at")
     if last_nudge:
         cool = (now - last_nudge).total_seconds() / 3600.0
         if cool < float(beat.get("nudge_cooldown_hours", 12)):
             return False, f"cooldown ({cool:.1f}h left of {beat.get('nudge_cooldown_hours')}h)"
-    idle_from = parse_timestamp(state.get("last_user_at")) or parse_timestamp(state.get("started_at"))
+    idle_from = (in_the_past(parse_timestamp(state.get("last_user_at")), now, "last_user_at")
+                 or in_the_past(parse_timestamp(state.get("started_at")), now, "started_at"))
     if idle_from is None:
         # nothing trustworthy to measure from: count idle from now, the state heals on the next save
         idle_from = now
@@ -303,6 +325,7 @@ def decide(cfg: dict, state: dict, entries: list[dict], now: datetime) -> tuple[
 def run_cycle(cfg: dict, memory_root: Path, today: str) -> dict | None:
     script = cfg.get("cycle_script")
     if not script:
+        print("warning: no cycle_script configured, so memory never decays or folds", file=sys.stderr)
         return None
     path = Path(script)
     if not path.exists():
@@ -475,6 +498,14 @@ def cmd_tick(cfg: dict, state: dict, now: datetime) -> int:
 
 
 def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = True) -> int:
+    """Reply to one user message.
+
+    Order is deliberate: settle storage first (cycle → decay, fold, rebuild INDEX), then recall and
+    reply, then write the episode/touch and refresh INDEX. Recalling from an already-consistent store
+    is what makes the weights mean "how strong is this memory today" instead of "how strong it was
+    before the last beat". Remembering the user's own sentence before replying would make the bot
+    parrot it back, so that is not done.
+    """
     memory_root = Path(cfg["memory_root"])
     ensure_index(cfg, memory_root, now.date().isoformat())
     roll_day(state, now.date().isoformat())
@@ -562,6 +593,11 @@ def cmd_run(cfg: dict, state: dict, now: datetime | None, once: bool) -> int:
         first = False
         try:
             cmd_tick(cfg, state, stamp)
+        except KeyboardInterrupt:
+            # Ctrl-C during a tick (an HTTP timeout, a subprocess) is still a clean stop
+            save_state(Path(cfg["state_file"]), state)
+            print("[run] stopped")
+            return 0
         except Exception as exc:
             # a resident process must survive one bad tick: log it, keep the heartbeat
             print(f"[run] tick failed: {exc}", file=sys.stderr)
