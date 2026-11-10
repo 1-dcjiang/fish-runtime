@@ -6,13 +6,13 @@ it owns the clock (a heartbeat decides when to speak), the mood, and the memory
 arithmetic — and delegates decay to the persona-and-memory skill's cycle script.
 
 Commands:
-  status                    print state, memory size, next-speak estimate
+  status                    print state, per-status counts, and whether it may speak (and why not)
   tick                      one heartbeat: maybe speak, then run the memory cycle
   run                       loop tick until interrupted (--once runs a single tick)
   say --text "..."          the user said something: recall, reply, maybe record
   verify --ids m-...        the user confirmed a memory: verified+1, mood up
 
-Every command takes --now for deterministic runs, so this is testable without a clock.
+--now gives deterministic runs (run honours it for the first beat only).
 Relative paths in the config resolve against the config file's directory.
 Stdlib only. No network unless a channel or model is configured.
 """
@@ -99,14 +99,39 @@ def resolve_paths(cfg: dict, base: Path) -> dict:
     return cfg
 
 
+def parse_timestamp(value) -> datetime | None:
+    """One bad string in state.json must not wedge the heartbeat — absent is the safe reading."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        print(f"warning: state timestamp {value!r} is unusable; treated as absent", file=sys.stderr)
+        return None
+
+
+TIMESTAMP_KEYS = ("mood_at", "last_user_at", "last_nudge_at", "started_at")
+
+
 def load_state(path: Path) -> dict:
+    state = {"mood": 0.0, "mood_at": None, "last_user_at": None,
+             "last_nudge_at": None, "sent_today": 0, "sent_day": None}
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            print("warning: state file unreadable, starting fresh", file=sys.stderr)
-    return {"mood": 0.0, "mood_at": None, "last_user_at": None,
-            "last_nudge_at": None, "sent_today": 0, "sent_day": None}
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            print(f"warning: state file unreadable ({exc}), starting fresh", file=sys.stderr)
+            return state
+        if not isinstance(loaded, dict):
+            print("warning: state file is not an object, starting fresh", file=sys.stderr)
+            return state
+        state.update(loaded)
+    for key in TIMESTAMP_KEYS:
+        if key in state and state[key] and parse_timestamp(state[key]) is None:
+            state[key] = None
+    return state
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -144,14 +169,26 @@ def ensure_index(cfg: dict, memory_root: Path, today: str) -> None:
     """A fresh store has no index yet; build it before the first read."""
     if (memory_root / "INDEX.md").exists():
         return
+    run_index(cfg, memory_root, today)
+
+
+def run_index(cfg: dict, memory_root: Path, today: str) -> str | None:
+    """Rebuild INDEX.md, so roles and statuses never lag the entry files. Returns the raw error, if any."""
     script = cfg.get("cycle_script")
     if not script or not Path(script).exists():
-        return
+        return None
     try:
-        subprocess.run([sys.executable, str(script), "index", "--root", str(memory_root),
-                        "--today", today], capture_output=True, text=True, timeout=60)
+        result = subprocess.run([sys.executable, str(script), "index", "--root", str(memory_root),
+                                 "--today", today], capture_output=True, text=True, timeout=60)
     except Exception as exc:
-        print(f"warning: could not build the index: {exc}", file=sys.stderr)
+        print(f"warning: could not rebuild the index: {exc}", file=sys.stderr)
+        return str(exc)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        note = detail[0] if detail else f"exit {result.returncode}"
+        print(f"warning: index rebuild failed: {note}", file=sys.stderr)
+        return note
+    return None
 
 
 def read_index(memory_root: Path) -> list[dict]:
@@ -172,24 +209,39 @@ def read_index(memory_root: Path) -> list[dict]:
     return entries
 
 
+STOPWORDS = {
+    # Common words that appear in almost every memory. They are not evidence of a shared topic.
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are",
+    "was", "were", "be", "been", "it", "its", "that", "this", "these", "those", "my", "your",
+    "i", "you", "we", "they", "he", "she", "do", "does", "did", "not", "no", "but", "so",
+    "as", "at", "by", "from", "if", "then", "than", "there", "here", "have", "has", "had",
+    "的", "了", "是", "我", "你", "他", "她", "它", "在", "和", "就", "也", "都", "很",
+}
+
+
 def tokens(text: str) -> set[str]:
-    """Rough tokenisation that also works for CJK: words plus character bigrams."""
+    """Rough tokenisation that also works for CJK: words plus character bigrams, minus stopwords."""
     clean = re.sub(r"[^\w\u4e00-\u9fff]+", " ", (text or "").lower())
-    words = {w for w in clean.split() if len(w) > 1}
+    words = {w for w in clean.split() if len(w) > 1 and w not in STOPWORDS}
     for run in re.findall(r"[\u4e00-\u9fff]{2,}", clean):
-        words.update(run[i:i + 2] for i in range(len(run) - 1))
+        words.update(run[i:i + 2] for i in range(len(run) - 1) if run[i:i + 2] not in STOPWORDS)
     return words
 
 
 def recall(entries: list[dict], text: str, limit: int = 3) -> list[dict]:
-    """Relevant memories only. No text at all falls back to the heaviest — a topic never does."""
+    """Relevant memories only. No text at all falls back to the heaviest — a topic never does.
+
+    Retired entries (`superseded`, `archived`) are not recallable: they still show in INDEX for a
+    while, and a replaced preference should not be echoed back as if it were current.
+    """
+    live = [e for e in entries if e["status"] not in {"superseded", "archived"}]
     if not text:
-        return sorted(entries, key=lambda e: -e["weight"])[:limit]
+        return sorted(live, key=lambda e: -e["weight"])[:limit]
     query = tokens(text)
     if not query:
         return []
     scored = []
-    for entry in entries:
+    for entry in live:
         overlap = len(query & tokens(entry["text"]))
         if overlap:
             scored.append((overlap * 2 + entry["weight"], entry))
@@ -226,23 +278,21 @@ def decide(cfg: dict, state: dict, entries: list[dict], now: datetime) -> tuple[
     sent_today = 0 if sent_day != now.date().isoformat() else int(state.get("sent_today", 0))
     if sent_today >= int(beat.get("max_messages_per_day", 3)):
         return False, "daily_cap"
-    last_user = state.get("last_user_at")
+    last_user = parse_timestamp(state.get("last_user_at"))
     if last_user:
-        gap = (now - datetime.fromisoformat(last_user)).total_seconds() / 60.0
+        gap = (now - last_user).total_seconds() / 60.0
         if gap < float(beat.get("min_gap_minutes", 20)):
             return False, f"recent_user_message ({int(gap)}m ago)"
-    last_nudge = state.get("last_nudge_at")
+    last_nudge = parse_timestamp(state.get("last_nudge_at"))
     if last_nudge:
-        cool = (now - datetime.fromisoformat(last_nudge)).total_seconds() / 3600.0
+        cool = (now - last_nudge).total_seconds() / 3600.0
         if cool < float(beat.get("nudge_cooldown_hours", 12)):
             return False, f"cooldown ({cool:.1f}h left of {beat.get('nudge_cooldown_hours')}h)"
-    if state.get("last_user_at"):
-        idle_from = state["last_user_at"]
-    elif state.get("started_at"):
-        idle_from = state["started_at"]
-    else:
-        idle_from = now.isoformat()
-    idle_hours = (now - datetime.fromisoformat(idle_from)).total_seconds() / 3600.0
+    idle_from = parse_timestamp(state.get("last_user_at")) or parse_timestamp(state.get("started_at"))
+    if idle_from is None:
+        # nothing trustworthy to measure from: count idle from now, the state heals on the next save
+        idle_from = now
+    idle_hours = (now - idle_from).total_seconds() / 3600.0
     if idle_hours < float(beat.get("nudge_after_hours", 6)):
         return False, f"not_idle_enough ({idle_hours:.1f}h)"
     if not peak_memory(entries, float(beat.get("min_weight", 0.5))):
@@ -449,10 +499,22 @@ def cmd_say(cfg: dict, state: dict, now: datetime, text: str, record: bool = Tru
         episode = write_episode(memory_root, text, now)
     if hits and cfg.get("cycle_script"):
         ids = [e["id"] for e in hits]
-        subprocess.run([sys.executable, str(cfg["cycle_script"]), "touch",
-                        "--root", str(memory_root), "--ids", *ids,
-                        "--today", now.date().isoformat()],
-                       capture_output=True, text=True, timeout=60)
+        command = [sys.executable, str(cfg["cycle_script"]), "touch",
+                   "--root", str(memory_root), "--ids", *ids,
+                   "--today", now.date().isoformat()]
+        try:
+            touched = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except Exception as exc:
+            print(f"warning: could not touch {', '.join(ids)}: {exc}", file=sys.stderr)
+            touched = None
+        if touched is not None and touched.returncode != 0:
+            # a silent no-op here means the reply claimed to remember something it did not
+            detail = (touched.stderr or touched.stdout).strip().splitlines()
+            note = detail[0] if detail else f"exit {touched.returncode}"
+            print(f"warning: touch refused for {', '.join(ids)}: {note}", file=sys.stderr)
+    if hits or episode:
+        # the cycle rebuilds INDEX before these writes; refresh it so the new state is visible at once
+        run_index(cfg, memory_root, now.date().isoformat())
 
     state["last_user_at"] = now.isoformat()
     state["mood"] = mood
@@ -492,23 +554,26 @@ def cmd_run(cfg: dict, state: dict, now: datetime | None, once: bool) -> int:
     import time
 
     interval = int(cfg["beat"].get("interval_seconds", 900))
-    state.setdefault("started_at", (now or datetime.now()).isoformat())
+    if not state.get("started_at"):
+        state["started_at"] = (now or datetime.now()).isoformat()
     first = True
     while True:
         stamp = now if first else datetime.now().replace(microsecond=0)
         first = False
         try:
             cmd_tick(cfg, state, stamp)
-        except KeyboardInterrupt:
-            save_state(Path(cfg["state_file"]), state)
-            print("[run] stopped")
-            return 0
         except Exception as exc:
             # a resident process must survive one bad tick: log it, keep the heartbeat
             print(f"[run] tick failed: {exc}", file=sys.stderr)
         if once:
             return 0
-        time.sleep(interval)
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            # Ctrl-C while waiting is the normal way this stops; no traceback, state on disk
+            save_state(Path(cfg["state_file"]), state)
+            print("[run] stopped")
+            return 0
 
 
 def parse_now(value: str | None) -> datetime | None:
@@ -543,7 +608,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if now is None:
         now = datetime.now().replace(microsecond=0)
-    state.setdefault("started_at", now.isoformat())
+    if not state.get("started_at"):
+        state["started_at"] = now.isoformat()
 
     if args.command == "status":
         return cmd_status(cfg, state, now)

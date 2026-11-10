@@ -27,8 +27,9 @@ stdout / Telegram / webhook
 | `say` | records what the **user** said as an episode (if it is worth keeping), touches the memories it matches, raises mood |
 | `verify` | marks a memory as independently confirmed (`verified +1`, weight `+0.10`) — the only path to identity |
 
-`--now` takes an explicit ISO timestamp on every command, so a tick can be replayed deterministically instead
-of "whatever the clock said". That is what makes the tests below possible.
+`--now` takes an explicit ISO timestamp, so a tick can be replayed deterministically instead of "whatever
+the clock said". That is what makes the tests below possible. (`run` honours it for the first beat only;
+after that a long-running process must follow the real clock.)
 
 ## Why this can't be listed as a skill
 
@@ -67,6 +68,11 @@ python fish.py run    --config config.example.json
 
 Python 3.10+. No dependencies outside the standard library.
 
+**Companion version.** The runtime does not implement the memory arithmetic itself; it calls the skill's
+`cycle`, `touch`, `index` and `verify` subcommands. It has been tested against `persona-and-memory` v4/v5
+(`--json` output on `cycle`, `verify --ids`, four-decimal weights). An older skill that only has
+`index`/`touch` still runs, but `verify` will fail loudly.
+
 ## Configuration
 
 | Key | Meaning |
@@ -77,7 +83,7 @@ Python 3.10+. No dependencies outside the standard library.
 | `cycle_script` | path to the skill's `memory_cycle.py`; if missing, the runtime warns and keeps going |
 | `run_cycle_on_tick` | run the decay/fold/archive/promote cycle after each beat |
 | `record_episodes` | `auto` (skip greetings and anything under 12 chars — "在吗" is not a memory), `always`, `off` |
-| `model.mode` | `offline` (deterministic template voice) or `openai` (`base_url`, `model`, `api_key_env`) |
+| `model.mode` | `offline` (deterministic template voice) or `openai` (`base_url`, `model`, `api_key_env`; `name` is accepted as a legacy alias for `model`) |
 | `channel.type` | `stdout`, `telegram` (`token_env`, `chat_id_env`), `webhook` (`url`) |
 | `beat.interval_seconds` | heartbeat period for `run` |
 | `beat.quiet_hours` | `[23, 7]` — handles windows that cross midnight |
@@ -121,11 +127,14 @@ believed for weeks finally got confirmed. The mood reaches the model only as a t
 python -m unittest discover -s tests -v
 ```
 
-36 tests, no network, no real clock. The 24 decision/mood/recall cases plus: config-relative paths actually
-resolving beside the config file, a four-decimal index line still parsing, an unrelated message touching
-nothing, `decide()` provably not mutating state, a broken persona card falling back instead of crashing,
-a broken `mood_at` using the stored mood, `verify` bumping `verified` and mood, unknown ids failing loudly,
-`--no-record`, a greeting not becoming a memory, `record_episodes: always` overriding that, and `run --once`.
+43 tests, no network, no real clock. The 24 original decision/mood/recall cases plus: config-relative paths
+actually resolving beside the config file, a four-decimal index line still parsing, an unrelated message
+touching nothing, shared function words (`the`) not counting as a shared topic, `decide()` provably not
+mutating state, a broken persona card falling back instead of crashing, a broken `mood_at` using the stored
+mood, corrupt state timestamps healing on the next save, `verify` bumping `verified` and mood, unknown ids
+failing loudly, superseded entries staying out of recall, `say` leaving a fresh INDEX, Ctrl-C while `run`
+waits exiting 0 with `[run] stopped`, `--no-record`, a greeting not becoming a memory,
+`record_episodes: always` overriding that, and `run --once`.
 
 ## Limits, stated rather than discovered
 
@@ -134,6 +143,8 @@ a broken `mood_at` using the stored mood, `verify` bumping `verified` and mood, 
 - **No locking.** Two processes writing `state.json` will race. One runtime per memory folder.
 - **The clock is local and naive.** `--now`, `quiet_hours` and decay all use the machine's local time with
   no timezone; moving the machine to another timezone shifts the quiet window, not the timestamps.
+- **State heals, but forgets.** An unreadable `state.json`, or a timestamp that is not a timestamp, is
+  dropped with a warning instead of wedging the heartbeat — at the cost of the mood and daily counter.
 - **`verify` is manual.** Nothing in the runtime can decide that a statement was "independently confirmed"
  — that is a human judgement, so it stays an explicit command instead of being guessed from conversation.
 - **Telegram caps a message at 4096 characters.** Longer replies are rejected by the API; this runtime does

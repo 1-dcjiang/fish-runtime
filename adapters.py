@@ -63,7 +63,8 @@ class ModelClient:
         self.persona = persona
         self.mode = self.config.get("mode", "offline")
         self.base_url = self.config.get("base_url", "https://api.openai.com/v1").rstrip("/")
-        self.model = self.config.get("name", "gpt-4o-mini")
+        # `model` is the documented key; `name` is accepted because the first cut used it
+        self.model = self.config.get("model") or self.config.get("name") or "gpt-4o-mini"
         self.timeout = int(self.config.get("timeout", 30))
 
     def compose(self, ref: str, mood: float, proactive: bool, memory_lines: list[str],
@@ -72,6 +73,8 @@ class ModelClient:
             return offline_reply(self.persona, ref, mood, proactive)
         key = os.environ.get(self.config.get("api_key_env", "OPENAI_API_KEY"))
         if not key:
+            print(f"warning: {self.config.get('api_key_env', 'OPENAI_API_KEY')} is unset; "
+                  "using the offline voice", file=sys.stderr)
             return offline_reply(self.persona, ref, mood, proactive)
         prompt = self._prompt(memory_lines, user_text, proactive)
         payload = {

@@ -437,6 +437,74 @@ class IntegrationTests(FishTest):
                       "--now", self.now])
 
 
+class RuntimeHygieneTests(FishTest):
+    """Bugs a reviewer finds by running it: config keys, Ctrl-C, corrupt state, stale INDEX."""
+
+    def test_model_key_is_honoured(self):
+        client = adapters.ModelClient({"mode": "openai", "model": "deepseek-chat"}, {})
+        self.assertEqual(client.model, "deepseek-chat")
+        legacy = adapters.ModelClient({"mode": "openai", "name": "gpt-4o"}, {})
+        self.assertEqual(legacy.model, "gpt-4o")
+
+    def test_ctrl_c_while_waiting_stops_cleanly(self):
+        from unittest import mock
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        self.seed_state(last_user_at="2026-11-09T20:00")
+        buffer = io.StringIO()
+        with mock.patch("time.sleep", side_effect=KeyboardInterrupt), redirect_stdout(buffer):
+            self.assertEqual(fish.main(["run", "--config", str(self.dir / "config.json"),
+                                        "--now", self.now]), 0)
+        self.assertIn("[run] stopped", buffer.getvalue())
+
+    def test_a_corrupt_state_timestamp_self_heals(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.9)
+        self.build_index()
+        self.config()
+        base = {"mood": 0.0, "mood_at": "garbage", "last_user_at": "yesterday",
+                "last_nudge_at": "sometime", "sent_today": 0, "sent_day": self.today,
+                "started_at": "also-bad"}
+        self.state_file.write_text(json.dumps(base), encoding="utf-8")
+        out = self.run_cmd(["tick", "--config", str(self.dir / "config.json"), "--now", self.now])
+        self.assertIn("[tick]", out)
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertIsNone(saved["last_user_at"])
+        self.assertTrue(saved["started_at"].startswith("2026-11-10T10:00"))
+
+    def test_superseded_entries_are_not_recalled(self):
+        write_entry(self.memory, "m-20261001-01", weight=0.9, status="superseded",
+                    body="Old preference about docker builds and the platform flag.\n")
+        write_entry(self.memory, "m-20261109-01", weight=0.6, status="active",
+                    body="Current preference about docker builds.\n")
+        entries = self.build_index()
+        hits = fish.recall(entries, "docker builds need the platform flag")
+        self.assertEqual([e["id"] for e in hits], ["m-20261109-01"])
+
+    def test_say_leaves_a_fresh_index(self):
+        write_entry(self.memory, "m-20261109-01", weight=0.80, body="User prefers Chinese replies.\n")
+        self.build_index()
+        self.config()
+        self.seed_state()
+        self.run_cmd(["say", "--config", str(self.dir / "config.json"), "--now", self.now,
+                      "--text", "记住我的 docker 构建需要 platform 参数"])
+        ids = [e["id"] for e in fish.read_index(self.memory)]
+        self.assertIn("m-20261110-01", ids, "the episode must be in INDEX before the next tick")
+
+    def test_shared_function_words_are_not_a_shared_topic(self):
+        write_entry(self.memory, "m-20261109-04", weight=0.62, kind="fact",
+                    body="Keep memory/INDEX.md under 40 lines and the index will stay readable.\n")
+        write_entry(self.memory, "m-20261109-01", weight=0.55,
+                    body="Docker builds need the platform flag on this machine.\n")
+        entries = self.build_index()
+        hits = fish.recall(entries, "remember my docker builds need the --platform linux/amd64 flag")
+        self.assertEqual([e["id"] for e in hits], ["m-20261109-01"],
+                         "the word 'the' must not make two unrelated memories look related")
+
+    def test_missing_state_file_is_not_fatal(self):
+        self.assertIsInstance(fish.load_state(self.dir / "missing.json"), dict)
+
+
 class FormatTests(unittest.TestCase):
     def test_parse_now_accepts_iso_and_space(self):
         self.assertEqual(fish.parse_now("2026-11-10T10:00"), datetime(2026, 11, 10, 10, 0))
